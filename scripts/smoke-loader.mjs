@@ -179,7 +179,6 @@ try {
     && completionNotices[0].data.source.form === 'notice'
     && /^阶段 2：AGENTS\.md 已生成（\d+ 字符）$/.test(completionNotices[0].data.source.summary)
     && /AGENTS\.md 已生成：/.test(completionNotices[0].data.content[0].text)
-    && /--dry-run/.test(completionNotices[0].data.content[0].text)
     && !completionNotices[0].data.content[0].text.includes('# AGENTS.md'),
     JSON.stringify(completionNotices.map(event => event.data)))
   // 阶段二 step（step 2）只转发思考过程：reasoning 流块可见、text 块不进入

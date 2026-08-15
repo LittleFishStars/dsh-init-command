@@ -262,11 +262,10 @@ test('两阶段调用：先判断项目类型，再嵌入提示词生成 AGENTS.
     stepOneChunks.map(event => event.seq),
   )
 
-  // 阶段二完成信息 notice：只报告路径、字符数与预览方式，不包含 AGENTS.md 内容。
+  // 阶段二完成信息 notice：只报告路径与字符数，不包含 AGENTS.md 内容。
   const completion = userMessages[2]
   assert.equal(completion.surfaceOp, 'append')
   assert.match(completion.data.content[0].text, /^AGENTS\.md 已生成：.+（\d+ 字符）。/)
-  assert.match(completion.data.content[0].text, /--dry-run/)
   assert.ok(!completion.data.content[0].text.includes('# AGENTS.md'))
   assert.deepEqual(completion.data.source, {
     kind: 'plugin',
@@ -286,7 +285,6 @@ test('两阶段调用：先判断项目类型，再嵌入提示词生成 AGENTS.
   assert.equal(success.data.usage, undefined)
   assert.match(success.data.message.content[0].text, /✅ \/init 完成：AGENTS\.md 已生成/)
   assert.match(success.data.message.content[0].text, /Node\.js web application/)
-  assert.match(success.data.message.content[0].text, /--dry-run/)
   assert.ok(!success.data.message.content[0].text.includes('# AGENTS.md'))
   // 完成 step 是最后一个事件：step 3 正常关闭。
   assert.equal(events.at(-1).type, 'step/end')
