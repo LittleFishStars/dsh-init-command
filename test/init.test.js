@@ -161,23 +161,52 @@ test('apply 注册 /init 命令', () => {
   assert.equal(command.input.hint, '[--dry-run] [--git] [--commit] [--think] [--depth <n>] [--ignore <pattern>]')
 })
 
-test('/init --help 显示用法且不调用模型', async () => {
+test('/init --help 在会话中完整展开显示用法且不调用模型', async () => {
   const llm = fakeLlm()
   const command = captureRegistration(llm)
+  const inv = invocation(scratch, '--help')
 
-  const result = await command.handler(invocation(scratch, '--help'))
+  const result = await command.handler(inv)
 
+  // 命令结果只返回一行短文本（多行命令结果会被 GUI 折叠成卡片）。
   assert.equal(result.kind, 'success')
-  assert.match(result.text, /^Usage: \/init/)
-  assert.match(result.text, /--dry-run/)
-  assert.match(result.text, /--commit/)
-  assert.match(result.text, /--depth <n>/)
+  assert.equal(result.text, '帮助已在上方展开显示。')
+  // 帮助以 assistant/message 完整写入会话（按完成信息的模式，展开显示）。
+  const helpMessage = inv.agent.session.log.find(event =>
+    event.type === 'assistant/message'
+    && event.data.message.content[0].text.startsWith('Usage: /init'))
+  assert.ok(helpMessage, '帮助文本应以 assistant/message 写入会话')
+  assert.match(helpMessage.data.message.content[0].text, /--dry-run/)
+  assert.match(helpMessage.data.message.content[0].text, /--commit/)
+  assert.match(helpMessage.data.message.content[0].text, /--depth <n>/)
+  assert.deepEqual(helpMessage.data.message.source, { kind: 'model', provider: 'deepseek', model: 'deepseek-chat' })
+  // 帮助 step 正常开合（notice + 消息 + step/end）。
+  assert.deepEqual(
+    inv.agent.session.log.filter(event => event.type === 'step/start').map(event => event.data.step),
+    [1],
+  )
+  assert.equal(inv.agent.session.log.at(-1).type, 'step/end')
   assert.equal(llm.calls.length, 0)
 
   // -h 同样可用。
   const short = await command.handler(invocation(scratch, '-h'))
   assert.equal(short.kind, 'success')
-  assert.match(short.text, /^Usage: \/init/)
+  assert.equal(short.text, '帮助已在上方展开显示。')
+})
+
+test('--help 在无可用模型路由时也正常工作（占位来源）', async () => {
+  const llm = fakeLlm()
+  const command = captureRegistration(llm)
+  const inv = invocation(scratch, '--help', { options: {} })
+
+  const result = await command.handler(inv)
+
+  assert.equal(result.kind, 'success')
+  const helpMessage = inv.agent.session.log.find(event =>
+    event.type === 'assistant/message'
+    && event.data.message.content[0].text.startsWith('Usage: /init'))
+  assert.ok(helpMessage)
+  assert.deepEqual(helpMessage.data.message.source, { kind: 'model', provider: 'dsh', model: 'init-help' })
 })
 
 test('--depth 缺值或非法值时返回用法错误', async () => {
