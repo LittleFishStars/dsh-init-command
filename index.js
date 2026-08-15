@@ -122,12 +122,17 @@ export function nextInitStep(session) {
 export async function collectTree(root) {
   const lines = [path.basename(root) + '/']
   const top = await listEntries(root, MAX_TOP_LEVEL_ENTRIES)
-  for (const entry of top) {
+  // 并行读取每个子目录的第二层条目（大仓库下比逐目录串行快得多），
+  // 再按顶层顺序拼装输出，保证文本稳定可复现。
+  const children = await Promise.all(top.map(entry =>
+    entry.isDirectory ? listEntries(path.join(root, entry.name), MAX_DIR_ENTRIES) : null,
+  ))
+  top.forEach((entry, index) => {
     lines.push(entry.isDirectory ? `${entry.name}/` : entry.name)
-    if (!entry.isDirectory) continue
-    const children = await listEntries(path.join(root, entry.name), MAX_DIR_ENTRIES)
-    for (const child of children) lines.push(`  ${child.isDirectory ? `${child.name}/` : child.name}`)
-  }
+    const sub = children[index]
+    if (sub === null) return
+    for (const child of sub) lines.push(`  ${child.isDirectory ? `${child.name}/` : child.name}`)
+  })
   return lines
 }
 
@@ -162,7 +167,7 @@ function userMessage(text) {
     id: randomUUID(),
     role: 'user',
     content: [{ type: 'text', text }],
-    source: { kind: 'plugin', plugin: 'dsh-init-command' },
+    source: { kind: 'plugin', plugin: name },
   }
 }
 
@@ -195,10 +200,7 @@ export function createAssembler() {
     push(chunk) {
       switch (chunk.type) {
         case 'block-start': {
-          if (!partials.has(chunk.index)) {
-            order.push(chunk.index)
-            partials.set(chunk.index, { blockType: chunk.blockType, text: '', toolCallArguments: '', block: undefined })
-          }
+          ensure(chunk.index, chunk.blockType)
           return
         }
         case 'text-delta':
@@ -347,6 +349,7 @@ export async function streamModelStage(ctx, session, invocation, route, step, pr
   }
   const assembler = createAssembler()
   const chunkSeqs = []
+  let blocks
   let finish
   let thrown
   try {
@@ -367,6 +370,7 @@ export async function streamModelStage(ctx, session, invocation, route, step, pr
       assembler.push(chunk)
     }
     finish = assembler.finish
+    blocks = assembler.blocks()
     // 正常终止（stop / max-tokens）时组装最终 assistant 消息；错误与中止
     // 只留下流式块，GUI 依据 step/end 边界把已输出部分渲染为 interrupted。
     if (visible && (finish?.kind === 'stop' || finish?.kind === 'max-tokens')) {
@@ -376,7 +380,7 @@ export async function streamModelStage(ctx, session, invocation, route, step, pr
         message: {
           id: randomUUID(),
           role: 'assistant',
-          content: assembler.blocks(),
+          content: blocks,
           source: { kind: 'model', provider: route.provider, model: route.model },
         },
         ...assembler.usage === undefined ? {} : { usage: assembler.usage },
@@ -398,7 +402,7 @@ export async function streamModelStage(ctx, session, invocation, route, step, pr
   if (text.trim().length === 0 && !tolerateTruncation) {
     throw new Error('the model returned empty output')
   }
-  return { text, blocks: assembler.blocks(), usage: assembler.usage, finish: assembler.finish }
+  return { text, blocks, usage: assembler.usage, finish: assembler.finish }
 }
 
 /** 阶段一提示词：让模型根据目录结构判断项目类型与工具链。 */
@@ -485,6 +489,15 @@ function generatePrompt(treeText, profile, existing) {
   ].join('\n')
 }
 
+/** 从配置对象提取 provider/model 对；任一字段缺失或为空时返回 undefined。 */
+function routeOf(value) {
+  if (typeof value?.provider === 'string' && value.provider.length > 0
+    && typeof value?.model === 'string' && value.model.length > 0) {
+    return { provider: value.provider, model: value.model }
+  }
+  return undefined
+}
+
 /**
  * 解析模型路由：插件配置 → 会话最近一次请求 → agent 选项。
  * @param {object | undefined} config - 插件配置（可选 provider/model）。
@@ -492,20 +505,9 @@ function generatePrompt(treeText, profile, existing) {
  * @returns {{ provider: string, model: string } | undefined} 路由；不可用时返回 undefined。
  */
 export function resolveRoute(config, agent) {
-  if (typeof config?.provider === 'string' && config.provider.length > 0
-    && typeof config?.model === 'string' && config.model.length > 0) {
-    return { provider: config.provider, model: config.model }
-  }
-  const latest = agent?.session?.requestHeader?.()?.config
-  if (typeof latest?.provider === 'string' && latest.provider.length > 0
-    && typeof latest?.model === 'string' && latest.model.length > 0) {
-    return { provider: latest.provider, model: latest.model }
-  }
-  if (typeof agent?.options?.provider === 'string' && agent.options.provider.length > 0
-    && typeof agent?.options?.model === 'string' && agent.options.model.length > 0) {
-    return { provider: agent.options.provider, model: agent.options.model }
-  }
-  return undefined
+  return routeOf(config)
+    ?? routeOf(agent?.session?.requestHeader?.()?.config)
+    ?? routeOf(agent?.options)
 }
 
 /**
@@ -720,9 +722,12 @@ export function gitignoreTemplate(profile) {
   return undefined
 }
 
+/** 响应体大小上限：.gitignore 模板远小于此，防御异常服务器撑爆内存。 */
+const MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+
 /**
  * 用 node:https 发起 GET 请求并返回状态码与响应文本（零依赖，无需
- * 全局 fetch）。
+ * 全局 fetch）。响应体超过 {@link MAX_RESPONSE_BYTES} 时中止请求。
  * @param {string} url - 请求地址。
  * @param {{ ca?: string | Buffer }} [options] - 附加 https 请求选项（如系统 CA）。
  * @returns {Promise<{ status: number, text: string }>} 响应。
@@ -731,7 +736,17 @@ function httpGetText(url, options = {}) {
   return new Promise((resolve, reject) => {
     const request = httpsGet(url, options, (response) => {
       const chunks = []
-      response.on('data', (chunk) => chunks.push(chunk))
+      let size = 0
+      response.on('data', (chunk) => {
+        size += chunk.length
+        if (size > MAX_RESPONSE_BYTES) {
+          request.destroy(new Error('response body exceeded 2 MiB limit'))
+          return
+        }
+        chunks.push(chunk)
+      })
+      // 响应流自身也可能出错（连接中途断开等），与请求错误一样拒绝。
+      response.on('error', reject)
       response.on('end', () => resolve({
         status: response.statusCode ?? 0,
         text: Buffer.concat(chunks).toString('utf8'),
@@ -940,9 +955,14 @@ function parseArgs(rawInput) {
   return flags
 }
 
+/** 文本的非空行（供提示词行数统计与单行摘要共用）。 */
+function nonEmptyLines(text) {
+  return text.split('\n').filter(line => line.trim().length > 0)
+}
+
 /** 提示词的非空行数（用于折叠行摘要）。 */
 export function promptLineCount(text) {
-  return text.split('\n').filter(line => line.trim().length > 0).length
+  return nonEmptyLines(text).length
 }
 
 /**
@@ -951,7 +971,7 @@ export function promptLineCount(text) {
  * @returns {string} 摘要。
  */
 function promptSummaryOf(text) {
-  const lines = text.split('\n').filter(line => line.trim().length > 0)
+  const lines = nonEmptyLines(text)
   const first = lines[0] ?? ''
   const trimmed = first.length > 80 ? `${first.slice(0, 77)}…` : first
   return `${lines.length} lines (${trimmed})`
@@ -1077,13 +1097,14 @@ async function executeInit(ctx, config, invocation) {
   // 继续（解析失败则降级 unknown）。
   const treeLines = await collectTree(root)
   const treeText = treeLines.join('\n')
+  const classifyText = classifyPrompt(treeText)
   const noThink = !parsed.think && await supportsReasoningEffort(ctx, route, invocation.signal, 'off')
   /** @type {Array<{ stage: string, route: { provider: string, model: string }, prompt: string, result: string }>} */
   const calls = []
   let step = nextInitStep(session)
   let profile
   try {
-    const raw = await streamModelStage(ctx, session, invocation, route, step++, classifyPrompt(treeText), {
+    const raw = await streamModelStage(ctx, session, invocation, route, step++, classifyText, {
       label: '阶段 1：项目分析',
       temperature: 0,
       tolerateTruncation: true,
@@ -1094,7 +1115,7 @@ async function executeInit(ctx, config, invocation) {
     calls.push({
       stage: 'classify',
       route,
-      prompt: classifyPrompt(treeText),
+      prompt: classifyText,
       result: `${profile.projectType} ${tags}`.trim(),
     })
   } catch (error) {
@@ -1113,7 +1134,8 @@ async function executeInit(ctx, config, invocation) {
   // --dry-run 时与阶段一一样完整流式显示，便于预览。
   let content
   try {
-    const generated = await streamModelStage(ctx, session, invocation, route, step, generatePrompt(treeText, profile, existingContent), {
+    const generateText = generatePrompt(treeText, profile, existingContent)
+    const generated = await streamModelStage(ctx, session, invocation, route, step, generateText, {
       label: '阶段 2：AGENTS.md 生成',
       silent: !parsed.dryRun,
     })
@@ -1121,7 +1143,7 @@ async function executeInit(ctx, config, invocation) {
     calls.push({
       stage: 'generate',
       route,
-      prompt: generatePrompt(treeText, profile, existingContent),
+      prompt: generateText,
       result: `AGENTS.md (${content.length} chars)${parsed.dryRun ? ' (dry run, not written)' : ''}`,
     })
   } catch (error) {
@@ -1200,7 +1222,9 @@ async function executeInit(ctx, config, invocation) {
  * @param {object | undefined} config - 插件配置（可选 provider/model）。
  */
 export function apply(ctx, config) {
-  ctx.commands.register({
+  // 返回 register 的卸载函数，符合 Cordis effect 约定：插件卸载时
+  // /init 自动注销。
+  return ctx.commands.register({
     name: 'init',
     description: 'Generate an AGENTS.md guide for this project with the model',
     input: { hint: '[--dry-run] [--git] [--think]' },
