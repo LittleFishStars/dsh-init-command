@@ -112,7 +112,14 @@ Model calls:
 dsh-init-command/
 ├── package.json            # npm 清单，声明 dsh.bundle（patch 层）
 ├── cordis.patch.yml        # 插入插件行的 patch 层
-├── index.js                # 插件实现（两阶段 LLM 流程、目录树收集、提示词）
+├── index.js                # 插件入口：注册 /init，再导出公共 API
+├── lib/
+│   ├── tree.js             # 两层目录树收集与文件存在性检查
+│   ├── prompts.js          # 两阶段提示词、分类解析、调用记录格式化
+│   ├── model.js            # LLM 流式调用与会话可见性（组装器、路由、step 显示）
+│   ├── gitignore.js        # .gitignore 模板匹配与下载（node:https + 系统 CA 回退）
+│   ├── git.js              # --git 步骤（仓库初始化、master → main、落盘）
+│   └── init.js             # /init 主流程（两阶段调用、写入 AGENTS.md）
 ├── scripts/
 │   └── smoke-loader.mjs    # 真实 Loader 组合冒烟测试（需要 DSH 源码环境）
 ├── test/

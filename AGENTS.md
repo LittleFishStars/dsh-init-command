@@ -6,7 +6,8 @@ This repository is a JavaScript/Node.js npm package that provides the `init` com
 
 Key files include:
 
-- `index.js` – the main entry point and CLI implementation.
+- `index.js` – the plugin entry: registers `/init` and re-exports the public API.
+- `lib/` – the implementation, split by responsibility: `tree.js` (two-level directory tree and file existence), `prompts.js` (two-stage prompt building, classification parsing, call-record formatting), `model.js` (LLM streaming, model routing, session visibility), `gitignore.js` (template matching and download with system CA fallback), `git.js` (the `--git` steps), and `init.js` (the two-stage `/init` flow).
 - `package.json` – standard Node.js package metadata; inspect this for dependencies, scripts, and module configuration.
 - `README.md` – project documentation; read this for intended usage and behavior.
 - `cordis.patch.yml` – a YAML patch configuration, likely related to the Cordis framework.
