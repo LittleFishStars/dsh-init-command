@@ -6,7 +6,7 @@ This repository is a JavaScript/Node.js npm package that provides the `init` com
 
 Key files include:
 
-- `index.js` – likely the main entry point and CLI implementation.
+- `index.js` – the main entry point and CLI implementation.
 - `package.json` – standard Node.js package metadata; inspect this for dependencies, scripts, and module configuration.
 - `README.md` – project documentation; read this for intended usage and behavior.
 - `cordis.patch.yml` – a YAML patch configuration, likely related to the Cordis framework.

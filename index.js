@@ -1,65 +1,31 @@
 /**
  * dsh-init-command — DSH 插件，提供 `/init` 斜杠命令。
  *
- * `/init` 通过两阶段大模型调用为当前项目生成 `AGENTS.md`：
+ * `/init` 两阶段调用大模型为当前项目生成 `AGENTS.md`：
+ *   1. 项目分析：发送两层目录结构，让模型判断项目类型与工具链（JSON）。
+ *   2. 生成：把判断结果与目录结构嵌入提示词，生成 AGENTS.md 并写入工作区
+ *      （提示词参考 opencode 的 /init 命令）。
  *
- *   1. 收集项目两层目录结构，作为第一条消息发送给大模型，让其判断
- *      项目类型与使用的工具链（输出结构化 JSON）。
- *   2. 把判断结果（项目类型、语言、工具链）与目录结构一起嵌入提示词
- *      再次调用大模型（提示词参考 opencode 的 /init 命令），生成
- *      `AGENTS.md` 内容并写入工作区。
+ * 已存在的 AGENTS.md 直接替换（旧内容作为改写参考）；`--dry-run` 只预览不写入。
  *
- * `AGENTS.md` 已存在时直接替换（旧内容会提供给模型作为改写参考）；
- * `--dry-run` 只预览生成内容而不写入。
+ * 可见性：阶段一实时流式显示（提示词为可折叠 notice 行，流块逐帧转发）；
+ * 阶段二默认 silent（内容直接写文件），成功后追加完成信息 notice 与一条
+ * 形如模型输出的成功状态消息，`--dry-run` 时完整显示。
  *
- * 生成内容在会话中的可见性：
+ * 合成显示只写 step 层事件、不写 turn 边界：正数 turn 会与 agent 循环的
+ * 编号冲突，turn 0 的 turn/end 又会被会话持久化读取路径拒绝加载；固定
+ * turn 0 + 递增 step 两全（详见 {@link INIT_TURN}）。所有事件类型都在
+ * 会话恢复白名单内。
  *
- *   - 阶段一（项目分析）始终实时写入会话日志，在 GUI 中像普通对话一样
- *     实时显示：提示词以 `user/message` 事件追加，来源标记为插件注入的
- *     `notice` 上下文——GUI 渲染为可折叠行：默认收起，只显示一行摘要
- *     （阶段与行数），点击展开完整提示词；发送给模型的也正是这段文本，
- *     角色同为 user，在模型侧与用户输入地位完全一致；模型的每个流块
- *     （text / reasoning）实时转发为 `assistant/chunk` 事件，GUI 按帧
- *     实时渲染，效果与思考过程一致；结束（或失败）后追加
- *     `assistant/message`、`step/end`；默认关闭思考模式
- *     （`reasoningEffort: 'off'`，仅当路由模型支持时，见
- *     {@link supportsReasoningEffort}），`--think` 恢复提供方默认行为；
- *   - 阶段二（AGENTS.md 生成）默认只输出完成信息：模型输出以
- *     silent 模式（见 {@link streamModelStage}）运行，不追加提示词、
- *     流块等会话事件，`AGENTS.md` 内容直接写入文件；生成成功后追加
- *     一条完成信息 notice 与一条形如模型正式输出的成功状态消息
- *     （见 {@link appendCompletionNotice}），让阶段二在会话中也有
- *     可见输出；只有 `--dry-run` 时才与阶段一一样完整显示，便于预览。
+ * 运行时零依赖（仅 Node 内置模块），无需构建即可从源码 / --patch / npm 加载。
  *
- * 合成显示只写 step 层事件，不写 `turn/start`/`turn/end`：agent 循环在
- * 构造时读取日志中最近一次 `turn/start` 并在内存中缓存自己的下一轮
- * 编号（lastTurn + 1），运行中按该计数分配、不回头读取日志，因此任何
- * 正数 turn 都可能与后续 agent 回合冲突；而 turn 0 的 `turn/end` 会被
- * 会话持久化读取路径按旧格式损坏拒绝（`turn < 1` 一律视为 malformed
- * pre-react-loop turn/end），导致重启后历史无法加载。不写 turn 边界则
- * 两全：step 仍以固定 turn 0 作为坐标（GUI 按 step 渲染流式输出），
- * 持久化读取路径不出现任何 turn 事件，重启后依旧安全加载。step 随
- * 每次调用递增（1,2 → 3,4 …），多次 `/init` 互不冲突。所有事件类型
- * 都在会话恢复白名单（`KNOWN_SESSION_EVENT_TYPES`）内。
+ * 用法：/init [--dry-run] [--git] [--think]
+ *   --dry-run  预览将生成的 AGENTS.md 而不写入
+ *   --think    阶段一改用思考模式（默认 reasoningEffort 'off'，更快更省 token）
+ *   --git      额外 git 初始化：仓库不存在时 init、master → main、
+ *              按项目类型下载 github/gitignore 模板（已存在不覆盖）
  *
- * 本模块运行时零依赖（仅使用 Node 内置模块）：LLM 调用通过
- * `ctx.llm.stream()` 服务完成，消息与流块按 `@deepseek-ai/dsh-llm` 的
- * 词汇结构手写构造，因此该 bundle 从源码、`--patch` 覆盖层或 npm/git
- * 安装加载都无需任何构建步骤。
- *
- * 用法：
- *   /init             生成 AGENTS.md（已存在时直接替换，旧内容作为改写参考）；
- *                     会话中显示完成信息与成功状态，完整内容仅 --dry-run 可见
- *   /init --dry-run   预览将生成的 AGENTS.md 而不写入
- *   /init --think     阶段一（项目分析）使用思考模式；默认不思考
- *                     （reasoningEffort 'off'，分类更快更省 token）
- *   /init --git       额外执行 git 初始化：仓库不存在时 `git init`、默认
- *                     分支为 master 时重命名为 main、按项目类型从
- *                     github/gitignore 下载合适的 .gitignore（已存在时
- *                     不覆盖）；与 --dry-run 组合时只提示将做什么。
- *
- * 模型路由（按优先级）：插件 config.provider/model → 会话最近一次请求
- * 使用的 provider/model → agent.options.provider/model。
+ * 模型路由（按优先级）：插件 config → 会话最近一次请求 → agent.options。
  */
 
 import { randomUUID } from 'node:crypto'
@@ -85,24 +51,15 @@ const MAX_TOP_LEVEL_ENTRIES = 120
 const MAX_DIR_ENTRIES = 40
 
 /**
- * /init 合成显示使用的坐标 turn 编号。合成显示只写 step 层事件，不写
- * `turn/start`/`turn/end`：agent 循环在构造时读取日志中最近一次
- * `turn/start` 并在内存中缓存自己的下一轮编号（lastTurn + 1），运行中
- * 按该计数分配、不回头读取日志，任何正数 turn 都可能与后续 agent 回合
- * 冲突；而 turn 0 的 `turn/end` 会被会话持久化读取路径按旧格式损坏
- * 拒绝（`turn < 1` 一律视为 malformed pre-react-loop turn/end），导致
- * 重启后历史无法加载。因此不写 turn 边界事件，只以固定 turn 0 作为
- * step 层事件的坐标（step 号见 {@link nextInitStep}），多次调用之间
- * 互不冲突。
+ * 合成显示的固定坐标 turn。
+ *
+ * 只写 step 层事件、不写 turn 边界：正数 turn 会与 agent 循环的编号冲突；
+ * turn 0 的 turn/end 会被会话持久化读取路径拒绝加载（turn < 1 视为
+ * malformed），重启后历史无法恢复。固定 turn 0 + 递增 step 两全。
  */
 export const INIT_TURN = 0
 
-/**
- * 计算下一次 /init 可用的 step 号：turn 0 中已出现过的最大 step + 1。
- * 首次调用为 1，第二次调用为 3，依此类推。
- * @param {object} session - 接收命令的 agent 的会话。
- * @returns {number} 下一个可用的 step 号。
- */
+/** 下一次 /init 可用的 step 号：turn 0 中已出现过的最大 step + 1（首次为 1）。 */
 export function nextInitStep(session) {
   let max = 0
   for (const event of session.events) {
@@ -114,16 +71,13 @@ export function nextInitStep(session) {
 }
 
 /**
- * 递归收集两层目录树（第一层全部条目 + 每个子目录的第二层条目），
- * 返回文本行数组。
- * @param {string} root - 项目目录。
- * @returns {Promise<string[]>} 树的行文本（目录以 `/` 结尾）。
+ * 收集两层目录树（顶层全部条目 + 每个子目录的第二层条目）为文本行。
+ * @returns {Promise<string[]>} 目录以 `/` 结尾的行。
  */
 export async function collectTree(root) {
   const lines = [path.basename(root) + '/']
   const top = await listEntries(root, MAX_TOP_LEVEL_ENTRIES)
-  // 并行读取每个子目录的第二层条目（大仓库下比逐目录串行快得多），
-  // 再按顶层顺序拼装输出，保证文本稳定可复现。
+  // 子目录条目并行读取，再按顶层顺序拼装，保证输出稳定。
   const children = await Promise.all(top.map(entry =>
     entry.isDirectory ? listEntries(path.join(root, entry.name), MAX_DIR_ENTRIES) : null,
   ))
@@ -136,12 +90,7 @@ export async function collectTree(root) {
   return lines
 }
 
-/**
- * 列出目录条目（排序、过滤噪音与隐藏项、按上限折叠）。
- * @param {string} dir - 目录路径。
- * @param {number} max - 最多返回的条目数。
- * @returns {Promise<Array<{ name: string, isDirectory: boolean }>>} 条目列表。
- */
+/** 列出目录条目：过滤噪音与隐藏项、排序、按上限折叠。 */
 async function listEntries(dir, max) {
   let entries
   try {
@@ -157,11 +106,7 @@ async function listEntries(dir, max) {
   return [...visible.slice(0, max), { name: `… (${visible.length - max} more entries)`, isDirectory: false }]
 }
 
-/**
- * 构造一条 user 角色消息（与 `@deepseek-ai/dsh-llm` 的 Message 形状一致）。
- * @param {string} text - 消息文本。
- * @returns {{ id: string, role: 'user', content: Array<{ type: 'text', text: string }>, source: { kind: 'plugin', plugin: string } }}
- */
+/** 构造一条 user 角色消息（与 `@deepseek-ai/dsh-llm` 的 Message 形状一致）。 */
 function userMessage(text) {
   return {
     id: randomUUID(),
@@ -174,13 +119,6 @@ function userMessage(text) {
 /**
  * 与 `@deepseek-ai/dsh-llm` 的 `BlockAssembler` 语义一致的迷你组装器
  * （零依赖手写）：按流顺序累积内容块，容忍只有 delta 的协议。
- * @returns {{
- *   push(chunk: object): void,
- *   text(): string,
- *   blocks(): Array<object>,
- *   usage: object | undefined,
- *   finish: { kind: string },
- * }}
  */
 export function createAssembler() {
   const partials = new Map()
@@ -264,11 +202,8 @@ export function createAssembler() {
 }
 
 /**
- * 把终止原因转换为错误消息；正常终止（stop）返回 undefined。
- * @param {{ kind: string, failure?: { message?: string } } | undefined} finish - 终止原因。
- * @param {boolean} [tolerateTruncation] - 为 true 时 `max-tokens` 截断不视为
- *   失败（调用方用已收集的文本继续，例如分类阶段解析 JSON）。
- * @returns {string | undefined} 错误消息，正常时返回 undefined。
+ * 终止原因 → 错误消息；正常终止（stop）返回 undefined。
+ * @param {boolean} [tolerateTruncation] - max-tokens 截断不视为失败（分类阶段继续解析）。
  */
 function finishError(finish, tolerateTruncation = false) {
   if (finish === undefined) return 'the model stream ended without a finish reason'
@@ -291,50 +226,33 @@ function finishError(finish, tolerateTruncation = false) {
 }
 
 /**
- * 执行一次 LLM 调用并把全过程实时写入会话日志，返回完整文本。
- * `silent` 模式下不写入任何会话事件（见下方 options）。
+ * 执行一次 LLM 调用；visible 时把全过程实时写入会话日志，silent 时不写
+ * 任何会话事件、只返回文本。
  *
- * 事件顺序（与 agent 循环一致，silent 模式下全部跳过）：
- * `step/start` → `user/message`（提示词，来源为插件注入的
- * `notice` 上下文，GUI 折叠显示一行摘要、点击展开完整提示词）→
- * `assistant/chunk`*（逐块实时转发，GUI 按帧渲染，如同思考过程）→
+ * visible 事件序列：`step/start` → `user/message`（提示词，notice 上下文，
+ * GUI 折叠为一行摘要）→ `assistant/chunk`*（逐块实时转发）→
  * `assistant/message`（正常终止时，携带 usage 与来源 chunk 序号）→
- * `step/end`。
- *
- * 合成显示不写 `turn/start`/`turn/end`（见 {@link INIT_TURN} 的说明）：
- * turn 0 的 `turn/end` 会被会话持久化读取路径按旧格式损坏拒绝，任何
- * 正数 turn 又可能与 agent 循环自己的编号冲突；只写 step 层事件即可
- * 完整驱动 GUI 的流式渲染，且重启后历史安全加载。调用失败（流错误、
- * 中止、抛异常）时不追加 `assistant/message`，只关闭 step：已流出的
- * 部分在 GUI 中按 interrupted 渲染，错误原因进入命令结果文本。
+ * `step/end`。不写 turn 边界（见 {@link INIT_TURN}）；调用失败时不追加
+ * `assistant/message`，只关闭 step，已流出部分在 GUI 中按 interrupted 渲染。
  *
  * @param {object} ctx - Cordis 上下文（携带 llm 服务）。
- * @param {object} session - 接收命令的 agent 的会话（`invocation.agent.session`）。
+ * @param {object} session - 接收命令的 agent 的会话。
  * @param {object} invocation - 命令调用负载（提供 signal）。
  * @param {{ provider: string, model: string }} route - 模型路由。
- * @param {number} step - 本次调用在 turn 0 中的 step 号（见 {@link nextInitStep}）。
- * @param {string} prompt - 发送给模型的 user 消息文本（同时以可折叠上下文行显示）。
- * @param {{ label?: string, temperature?: number, reasoningEffort?: string, tolerateTruncation?: boolean, silent?: boolean }} [options] -
- *   `label` 用于折叠行的摘要（阶段说明），`temperature` 与 `reasoningEffort`
- *   为附加调用参数（`reasoningEffort` 例如 `'off'` 可关闭思考模式），
- *   `tolerateTruncation` 为 true 时 max-tokens 截断不视为失败；`silent`
- *   为 true 时完全不写会话日志——不追加提示词、
- *   流块与 step 开合事件，调用静默执行，返回文本由调用方直接使用（例如
- *   写入文件），默认 /init 的生成阶段即此模式；该模式下调用方通常在
- *   成功后自行追加一条完成信息（见 {@link appendCompletionNotice}），
- *   让阶段二在会话中仍有可见输出。
- * @returns {Promise<{ text: string, blocks: Array<object>, usage?: object, finish: { kind: string } }>} 模型输出。
+ * @param {number} step - 本次调用在 turn 0 中的 step 号。
+ * @param {string} prompt - 发送给模型的 user 消息文本。
+ * @param {{ label?: string, temperature?: number, reasoningEffort?: string, tolerateTruncation?: boolean, silent?: boolean }} [options]
+ *   `label` 用于折叠行摘要；`silent` 为 true 时不写任何会话事件（生成阶段
+ *   默认，成功后由调用方追加完成信息，见 {@link appendCompletionNotice}）。
+ * @returns {Promise<{ text: string, blocks: Array<object>, usage?: object, finish: { kind: string } }>}
  */
 export async function streamModelStage(ctx, session, invocation, route, step, prompt, options = {}) {
   const { label = 'Init', temperature, reasoningEffort, tolerateTruncation = false, silent = false } = options
-  // silent 模式：不向会话日志追加任何事件（提示词、流块、step 开合），
-  // 调用在会话中完全不可见，只有返回文本与调用记录（命令结果）可追溯。
   const visible = !silent
   if (visible) {
     session.append('step/start', { turn: INIT_TURN, step })
-    // 提示词以插件注入的 notice 上下文进入对话流：GUI 默认折叠为一行摘要，
-    // 点击展开完整提示词；发送给模型的也正是这段文本（见下方 llm.stream
-    // 的 messages），在模型侧与用户输入地位完全一致。
+    // 提示词以 notice 上下文进入对话流：GUI 默认折叠为一行摘要，点击展开；
+    // 发送给模型的也正是这段文本，在模型侧与用户输入地位一致。
     session.append('user/message', {
       id: randomUUID(),
       role: 'user',
@@ -362,8 +280,6 @@ export async function streamModelStage(ctx, session, invocation, route, step, pr
       ...invocation.signal === undefined ? {} : { signal: invocation.signal },
     })
     for await (const chunk of stream) {
-      // 实时转发：每个 chunk 作为 assistant/chunk 事件追加，GUI 收到后
-      // 立即按帧渲染，效果与思考过程的实时输出一致。
       if (visible) {
         chunkSeqs.push(session.append('assistant/chunk', { turn: INIT_TURN, step, chunk }).seq)
       }
@@ -371,8 +287,7 @@ export async function streamModelStage(ctx, session, invocation, route, step, pr
     }
     finish = assembler.finish
     blocks = assembler.blocks()
-    // 正常终止（stop / max-tokens）时组装最终 assistant 消息；错误与中止
-    // 只留下流式块，GUI 依据 step/end 边界把已输出部分渲染为 interrupted。
+    // 正常终止才组装最终消息；错误/中止只留流式块，由 GUI 按 interrupted 渲染。
     if (visible && (finish?.kind === 'stop' || finish?.kind === 'max-tokens')) {
       session.append('assistant/message', {
         turn: INIT_TURN,
@@ -397,8 +312,7 @@ export async function streamModelStage(ctx, session, invocation, route, step, pr
   const error = finishError(finish, tolerateTruncation)
   if (error !== undefined) throw new Error(error)
   const text = assembler.text()
-  // 宽容模式下允许空输出：调用方（分类阶段）会把无法解析的内容降级
-  // 为 unknown 项目类型继续流程，而不是让整个 /init 失败。
+  // 宽容模式允许空输出：分类阶段会把无法解析的内容降级为 unknown 继续。
   if (text.trim().length === 0 && !tolerateTruncation) {
     throw new Error('the model returned empty output')
   }
@@ -419,9 +333,7 @@ function classifyPrompt(treeText) {
 
 /**
  * 从模型输出中宽容地解析 JSON：剥离 markdown 围栏与前后噪音，
- * 截取第一个 `{` 到最后一个 `}` 之间的内容。
- * @param {string} text - 模型输出。
- * @returns {unknown} 解析结果；解析失败返回 null。
+ * 截取第一个 `{` 到最后一个 `}` 之间的内容；失败返回 null。
  */
 export function parseClassifiedJson(text) {
   const start = text.indexOf('{')
@@ -434,11 +346,7 @@ export function parseClassifiedJson(text) {
   }
 }
 
-/**
- * 把判断结果规整为字符串字段（宽容处理缺失/类型错误）。
- * @param {unknown} value - 模型返回的 JSON。
- * @returns {{ projectType: string, languages: string, toolchain: string, summary: string }}
- */
+/** 把判断结果规整为字符串字段（宽容处理缺失/类型错误）。 */
 export function normalizeClassified(value) {
   const record = /** @type {Record<string, unknown>} */ (typeof value === 'object' && value !== null ? value : {})
   const stringOf = (key, fallback) => typeof record[key] === 'string' && record[key].trim().length > 0
@@ -489,7 +397,7 @@ function generatePrompt(treeText, profile, existing) {
   ].join('\n')
 }
 
-/** 从配置对象提取 provider/model 对；任一字段缺失或为空时返回 undefined。 */
+/** 从配置对象提取 provider/model 对；字段缺失或为空时返回 undefined。 */
 function routeOf(value) {
   if (typeof value?.provider === 'string' && value.provider.length > 0
     && typeof value?.model === 'string' && value.model.length > 0) {
@@ -498,12 +406,7 @@ function routeOf(value) {
   return undefined
 }
 
-/**
- * 解析模型路由：插件配置 → 会话最近一次请求 → agent 选项。
- * @param {object | undefined} config - 插件配置（可选 provider/model）。
- * @param {object | undefined} agent - 接收命令的 agent 句柄。
- * @returns {{ provider: string, model: string } | undefined} 路由；不可用时返回 undefined。
- */
+/** 解析模型路由：插件配置 → 会话最近一次请求 → agent 选项。 */
 export function resolveRoute(config, agent) {
   return routeOf(config)
     ?? routeOf(agent?.session?.requestHeader?.()?.config)
@@ -511,17 +414,10 @@ export function resolveRoute(config, agent) {
 }
 
 /**
- * 探测路由模型是否支持指定的 reasoning effort（如 `'off'` 关闭思考）。
- * 通过 llm 服务的 `resolveCallConfig` 预检：纯能力解析，不发起模型调用、
- * 无 token 消耗。服务未暴露该方法（如测试用的 fake llm）时视为支持。
- * 任何探测失败（模型不支持 reasoning、能力查询不可用等）都按不支持
- * 处理，由调用方放弃传参——不支持思考开关的模型因此不会收到
- * `UNSUPPORTED_REASONING_EFFORT` 错误，只是保持其默认行为。
- * @param {object} ctx - Cordis 上下文（携带 llm 服务）。
- * @param {{ provider: string, model: string }} route - 模型路由。
- * @param {AbortSignal | undefined} signal - 取消信号。
- * @param {string} effort - 要探测的 effort 标识（如 `'off'`）。
- * @returns {Promise<boolean>} 路由模型是否支持该 effort。
+ * 探测路由模型是否支持指定 reasoning effort（如 'off'）。
+ * 通过 `resolveCallConfig` 预检（纯能力解析，无 token 消耗）；服务未暴露
+ * 该方法（如 fake llm）或探测失败时按不支持处理，由调用方放弃传参——
+ * 不支持的模型因此不会收到 UNSUPPORTED_REASONING_EFFORT 错误。
  */
 async function supportsReasoningEffort(ctx, route, signal, effort) {
   if (typeof ctx.llm.resolveCallConfig !== 'function') return true
@@ -546,10 +442,9 @@ async function exists(file) {
 }
 
 /**
- * `--git` 的 .gitignore 模板匹配表：`[模板名, 命中关键词数组]`，按优先
- * 顺序检查（靠前的模板先命中）。模板名必须是 github/gitignore 仓库顶层
- * 的真实文件名；关键词不含空格时为分词精确匹配，含空格时为整体短语
- * 匹配（大小写不敏感）。
+ * .gitignore 模板匹配表：[模板名, 关键词数组]，按顺序检查（靠前的先命中）。
+ * 模板名必须是 github/gitignore 仓库顶层的真实文件名；关键词不含空格为
+ * 分词精确匹配，含空格为整体短语匹配（大小写不敏感）。
  */
 const GITIGNORE_TEMPLATES = [
   ['Nextjs', ['next.js', 'nextjs', 'next']],
@@ -698,12 +593,7 @@ const GITIGNORE_TEMPLATES = [
   ['SketchUp', ['sketchup']],
 ]
 
-/**
- * 根据项目分析结果（语言、工具链、项目类型）匹配 github/gitignore 的
- * 模板名；无匹配时返回 undefined。
- * @param {{ projectType: string, languages: string, toolchain: string }} profile - 规整后的项目画像。
- * @returns {string | undefined} 模板名（如 'Node'），无匹配时 undefined。
- */
+/** 按语言/工具链/项目类型匹配 github/gitignore 模板名；无匹配返回 undefined。 */
 export function gitignoreTemplate(profile) {
   const candidates = [profile.languages, profile.toolchain, profile.projectType]
     .filter(Boolean)
@@ -722,16 +612,10 @@ export function gitignoreTemplate(profile) {
   return undefined
 }
 
-/** 响应体大小上限：.gitignore 模板远小于此，防御异常服务器撑爆内存。 */
+/** 响应体大小上限（.gitignore 模板远小于此）。 */
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 
-/**
- * 用 node:https 发起 GET 请求并返回状态码与响应文本（零依赖，无需
- * 全局 fetch）。响应体超过 {@link MAX_RESPONSE_BYTES} 时中止请求。
- * @param {string} url - 请求地址。
- * @param {{ ca?: string | Buffer }} [options] - 附加 https 请求选项（如系统 CA）。
- * @returns {Promise<{ status: number, text: string }>} 响应。
- */
+/** 用 node:https 发起 GET 请求，返回状态码与响应文本（零依赖）。 */
 function httpGetText(url, options = {}) {
   return new Promise((resolve, reject) => {
     const request = httpsGet(url, options, (response) => {
@@ -745,7 +629,6 @@ function httpGetText(url, options = {}) {
         }
         chunks.push(chunk)
       })
-      // 响应流自身也可能出错（连接中途断开等），与请求错误一样拒绝。
       response.on('error', reject)
       response.on('end', () => resolve({
         status: response.statusCode ?? 0,
@@ -791,12 +674,9 @@ const TLS_VERIFY_CODES = new Set([
 ])
 
 /**
- * 默认下载器：先用 Node 内置 CA 库请求；若因证书校验失败（例如本机
- * 使用系统信任库的代理/MITM 环境，Node 内置 CA 不包含其根证书）则读取
- * 系统 CA 证书包重试一次——仍然校验证书，只是信任库与 curl 等系统工具
- * 一致。
- * @param {string} url - 请求地址。
- * @returns {Promise<{ status: number, text: string }>} 响应。
+ * 默认下载器：先用 Node 内置 CA 库请求；若证书校验失败（如本机使用系统
+ * 信任库的代理/MITM 环境，Node 内置 CA 不含其根证书）则读取系统 CA 包
+ * 重试一次——仍然校验证书，只是信任库与 curl 等系统工具一致。
  */
 async function fetchGitignore(url) {
   try {
@@ -810,12 +690,8 @@ async function fetchGitignore(url) {
 }
 
 /**
- * 从 github/gitignore 仓库（默认分支 main）下载指定模板的 .gitignore
- * 内容。`fetcher` 可注入（测试用），默认走 node:https，并在证书校验
- * 失败时回退到系统 CA 信任库（见 {@link fetchGitignore}）。
- * @param {string} template - 模板名（如 'Node'）。
- * @param {(url: string) => Promise<{ status: number, text: string }>} [fetcher] - 请求函数。
- * @returns {Promise<{ ok: boolean, status: number, text?: string }>} 结果。
+ * 从 github/gitignore（main 分支）下载指定模板；`fetcher` 可注入（测试用），
+ * 默认走 node:https 并在证书校验失败时回退系统 CA（见 {@link fetchGitignore}）。
  */
 export async function downloadGitignore(template, fetcher = fetchGitignore) {
   const url = `https://raw.githubusercontent.com/github/gitignore/main/${encodeURIComponent(template)}.gitignore`
@@ -827,10 +703,8 @@ export async function downloadGitignore(template, fetcher = fetchGitignore) {
 const runGit = promisify(execFile).bind(null, 'git')
 
 /**
- * 若当前分支为 master 则重命名为 main。已有提交时用 `git branch -m`；
- * 尚未提交（unborn 分支）时退回 `git symbolic-ref`。
- * @param {string} root - 仓库目录。
- * @returns {Promise<boolean>} 是否发生了重命名。
+ * 若当前分支为 master 则重命名为 main：已有提交用 `git branch -m`，
+ * 尚未提交（unborn）退回 `git symbolic-ref`。
  */
 export async function renameMasterToMain(root) {
   let current
@@ -855,12 +729,10 @@ export async function renameMasterToMain(root) {
 }
 
 /**
- * 确保 root 下存在 git 仓库：不存在时 `git init`，并把 master 默认分支
- * 重命名为 main（见 {@link renameMasterToMain}）。
- * @param {string} root - 项目目录。
+ * 确保 root 下存在 git 仓库：缺失时 `git init`，并把 master 分支重命名为
+ * main（见 {@link renameMasterToMain}）。
  * @returns {Promise<{ status: 'initialized' | 'exists' | 'skipped-inside-parent' | 'no-git', toplevel?: string, renamed?: boolean }>}
- *   仓库状态；`skipped-inside-parent` 表示项目位于某个父仓库内（不新建
- *   嵌套仓库），`no-git` 表示系统未安装 git。
+ *   `skipped-inside-parent`：项目位于父仓库内，不新建嵌套仓库；`no-git`：系统无 git。
  */
 export async function ensureGitRepo(root) {
   let toplevel
@@ -886,13 +758,9 @@ export async function ensureGitRepo(root) {
 }
 
 /**
- * 执行 `--git` 的完整流程：确保仓库存在（必要时初始化）、master → main、
- * 按项目类型从 github/gitignore 下载 .gitignore（已存在时不覆盖）。
- * 每一步都通过返回值中的文本行汇报，不抛出（下载失败只记一行说明）。
- * @param {string} root - 项目目录。
- * @param {{ projectType: string, languages: string, toolchain: string }} profile - 项目画像。
+ * 执行 `--git` 全流程：确保仓库存在（必要时初始化）、master → main、
+ * 下载 .gitignore（已存在不覆盖）。每步以文本行汇报，不抛出。
  * @param {{ fetcher?: (url: string) => Promise<{ status: number, text: string }> }} [options] - 可注入下载函数（测试用）。
- * @returns {Promise<string[]>} 描述各步骤结果的文本行。
  */
 export async function applyGitSteps(root, profile, options = {}) {
   const lines = []
@@ -932,12 +800,7 @@ export async function applyGitSteps(root, profile, options = {}) {
   return lines
 }
 
-/**
- * 解析 `/init` 参数。
- * @param {string} rawInput - 命令名之后的原文文本。
- * @returns {{ dryRun: boolean, git: boolean, think: boolean } | string} 解析出的标志，
- *   或遇到未知参数时的用法错误消息。
- */
+/** 解析 `/init` 参数；遇到未知参数返回用法错误消息。 */
 function parseArgs(rawInput) {
   const args = rawInput.trim().split(/\s+/u).filter(Boolean)
   const flags = { dryRun: false, git: false, think: false }
@@ -965,11 +828,7 @@ export function promptLineCount(text) {
   return nonEmptyLines(text).length
 }
 
-/**
- * 把提示词压缩为单行摘要：非空行数 + 首行截断。
- * @param {string} text - 完整提示词。
- * @returns {string} 摘要。
- */
+/** 把提示词压缩为单行摘要：非空行数 + 首行截断。 */
 function promptSummaryOf(text) {
   const lines = nonEmptyLines(text)
   const first = lines[0] ?? ''
@@ -978,13 +837,9 @@ function promptSummaryOf(text) {
 }
 
 /**
- * 把两次模型调用渲染为对话历史可读的记录块。它随命令结果（
- * `command/done` 事件）一起持久化到会话日志——这是仓库外插件安全
- * 记录自定义信息的方式：直接 `session.append()` 自定义事件类型会被
- * 会话恢复路径（`KNOWN_SESSION_EVENT_TYPES` 白名单）拒绝加载，而
- * `command/done` 属于白名单事件，恢复安全且在 GUI 中可见。
- * @param {Array<{ stage: string, route: { provider: string, model: string }, prompt: string, result: string }>} calls - 调用记录。
- * @returns {string} 记录文本块。
+ * 把两次模型调用渲染为命令结果里的记录块。随 `command/done` 事件持久化
+ * （白名单事件，恢复安全且 GUI 可见；直接 append 自定义事件类型会被
+ * 会话恢复路径拒绝加载）。
  */
 function formatModelCalls(calls) {
   const lines = calls.map((call, index) => {
@@ -995,25 +850,15 @@ function formatModelCalls(calls) {
 }
 
 /**
- * 追加阶段二的完成 step（默认模式）：`AGENTS.md` 生成内容不进入会话
- * （silent 流式调用，见 {@link streamModelStage}），成功后写入两条可见
- * 输出——一条插件 notice（折叠行摘要：阶段与字符数）与一条形如模型
- * 正式输出的成功状态消息。事件序列与阶段一的合成显示一致：
- * `step/start` → `user/message`（notice 上下文，GUI 默认折叠为一行摘要、
- * 点击展开完整文本）→ `assistant/message`（成功状态）→ `step/end`；
- * 不写 turn 边界（见 {@link INIT_TURN}），step 号与阶段二流式调用共用。
+ * 追加阶段二的完成 step（默认模式）：一条完成信息 notice（折叠行摘要）
+ * 与一条形如模型正式输出的成功状态消息。事件序列与阶段一一致：
+ * `step/start` → `user/message`（notice）→ `assistant/message` → `step/end`；
+ * 不写 turn 边界（见 {@link INIT_TURN}）。
  *
- * 成功状态消息以 `assistant/message` 呈现，来源复用本次模型路由
- * （kind 为 model 并携带 provider/model）：会话持久化加载路径要求
- * `assistant/message` 必须携带 model 来源（插件来源会在重启时被拒绝
- * 加载），该形状也让 GUI 按模型正式输出渲染。文本由插件合成，非模型
- * 生成，仅作状态汇报。
- * @param {object} session - 接收命令的 agent 的会话。
- * @param {number} step - 阶段二的 step 号（`nextInitStep` 之后递增得到）。
- * @param {{ provider: string, model: string }} route - 本次 /init 的模型路由。
- * @param {{ summary: string, text: string }} notice - 完成信息 notice：
- *   `summary` 为折叠行摘要（GUI 默认只显示这一行），`text` 为展开后的完整文本。
- * @param {string} success - 成功状态消息文本（以 assistant 消息呈现）。
+ * 成功状态消息以 `assistant/message` 呈现且来源复用模型路由：持久化加载
+ * 路径要求 `assistant/message` 必须携带 model 来源（插件来源会被拒绝）。
+ * 文本由插件合成，非模型生成，仅作状态汇报。
+ * @param {{ summary: string, text: string }} notice - 完成信息：summary 为折叠行摘要，text 为展开文本。
  */
 function appendCompletionNotice(session, step, route, notice, success) {
   session.append('step/start', { turn: INIT_TURN, step })
@@ -1043,24 +888,10 @@ function appendCompletionNotice(session, step, route, notice, success) {
 
 /**
  * 执行 `/init` 两阶段流程：收集目录树 → 判断项目类型 → 生成 AGENTS.md。
- *
- * 阶段一通过 {@link streamModelStage} 实时写入会话日志：提示词以
- * user 消息完整显示（与用户输入同等地位），模型的流块逐块实时转发
- * （GUI 按帧渲染，效果与思考过程一致）；阶段一默认关闭思考模式
- * （`reasoningEffort: 'off'`，仅当路由模型支持时；`--think` 恢复提供方
- * 默认行为）。阶段二默认 silent 流式执行，
- * 生成内容直接写入文件、不进入会话，成功后追加完成信息 notice 与
- * 一条形如模型正式输出的成功状态消息（{@link appendCompletionNotice}），
- * 只有 `--dry-run` 时才与阶段一一样完整显示。调用记录（阶段、路由、
- * 提示词摘要、结果）仍随命令结果写入对话历史，详见
- * {@link formatModelCalls}。
- *
- * `--git` 时在写入 AGENTS.md 后执行 {@link applyGitSteps}：初始化 git
- * 仓库（如缺失）、默认分支 master → main、按项目类型从 github/gitignore
- * 下载 .gitignore（已存在时不覆盖）；`--dry-run` 组合下只提示将做什么。
- * @param {object} ctx - Cordis 上下文（携带 commands 与 llm 服务）。
- * @param {object | undefined} config - 插件配置。
- * @param {object} invocation - 命令注册表传入的调用负载。
+ * 阶段一实时流式显示，默认关闭思考模式（`--think` 恢复提供方默认）；
+ * 阶段二默认 silent（内容直接写文件，成功后追加完成信息，见
+ * {@link appendCompletionNotice}），`--dry-run` 时完整流式显示。
+ * `--git` 时写入后执行 {@link applyGitSteps}（与 `--dry-run` 组合只提示）。
  * @returns {Promise<{ kind: 'success' | 'error', text: string }>} 命令结果。
  */
 async function executeInit(ctx, config, invocation) {
@@ -1088,13 +919,8 @@ async function executeInit(ctx, config, invocation) {
     ? await readFile(target, 'utf8').catch(() => undefined)
     : undefined
 
-  // 阶段一：发送两层目录结构，让模型判断项目类型与工具链。
-  // 默认关闭思考模式（--think 时保持提供方默认行为）：分类任务简单，
-  // 不思考更省时省 token；仅当路由模型支持 'off' 时才传参（见
-  // supportsReasoningEffort），不支持思考开关的模型保持其默认行为。
-  // 宽容截断：不设置 maxTokens，由适配器默认上限决定；若使用思考模式，
-  // reasoning 输出可能占满预算，只要已收集的文本仍可解析出 JSON 就
-  // 继续（解析失败则降级 unknown）。
+  // 阶段一：让模型判断项目类型。默认关闭思考（--think 恢复），仅当路由
+  // 模型支持时才传 reasoningEffort；宽容截断——JSON 解析失败则降级 unknown。
   const treeLines = await collectTree(root)
   const treeText = treeLines.join('\n')
   const classifyText = classifyPrompt(treeText)
@@ -1128,10 +954,7 @@ async function executeInit(ctx, config, invocation) {
     return { kind: 'error', text: 'Init cancelled.' }
   }
 
-  // 阶段二：把项目类型嵌入提示词，生成 AGENTS.md 内容。
-  // 默认静默生成（silent 模式）：模型输出不进入会话日志，直接写入文件，
-  // 只在成功后追加一条简短完成信息（见下方 appendCompletionNotice）；
-  // --dry-run 时与阶段一一样完整流式显示，便于预览。
+  // 阶段二：生成 AGENTS.md。默认 silent（内容直接写文件），--dry-run 时完整流式显示。
   let content
   try {
     const generateText = generatePrompt(treeText, profile, existingContent)
@@ -1185,10 +1008,7 @@ async function executeInit(ctx, config, invocation) {
     }
   }
 
-  // 阶段二默认不在会话中展示 AGENTS.md 内容（silent 流式调用），但追加
-  // 一条完成信息 notice 与一条形如模型正式输出的成功状态消息，让阶段二
-  // 在会话中也有可见输出；完整内容只有 --dry-run 才会流式显示（见上方
-  // 阶段二的 streamModelStage 调用）。
+  // 默认模式不展示 AGENTS.md 内容，但追加完成信息与成功状态消息（见 appendCompletionNotice）。
   if (!parsed.dryRun) {
     appendCompletionNotice(session, step, route, {
       summary: `阶段 2：AGENTS.md 已生成（${content.length} 字符）`,
@@ -1215,15 +1035,8 @@ async function executeInit(ctx, config, invocation) {
   }
 }
 
-/**
- * 为每个组合的人类命令适配器注册 `/init`。
- * @param {import('@deepseek-ai/cordis').Context} ctx - 上下文；注册是
- *   effect，会在本插件卸载时自动撤销。
- * @param {object | undefined} config - 插件配置（可选 provider/model）。
- */
+/** 注册 `/init`；返回 register 的卸载函数（Cordis effect 约定）。 */
 export function apply(ctx, config) {
-  // 返回 register 的卸载函数，符合 Cordis effect 约定：插件卸载时
-  // /init 自动注销。
   return ctx.commands.register({
     name: 'init',
     description: 'Generate an AGENTS.md guide for this project with the model',
