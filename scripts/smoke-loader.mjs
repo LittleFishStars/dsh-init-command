@@ -244,6 +244,14 @@ try {
   const dry = await context.commands.execute(owner, '/init --dry-run', signal)
   check('--dry-run reports without writing', dry?.result.kind === 'success' && dry.result.text.includes('dry run'))
 
+  const help = await context.commands.execute(owner, '/init --help', signal)
+  check('--help shows usage without model calls', help?.result.kind === 'success'
+    && help.result.text.startsWith('Usage: /init'), help?.result.text ?? '')
+
+  const depth = await context.commands.execute(owner, '/init --depth 1', signal)
+  check('--depth 1 still succeeds', depth?.result.kind === 'success'
+    && depth.result.text.includes('Initialized'), depth?.result.text ?? '')
+
   const bogus = await context.commands.execute(owner, '/init --bogus', signal)
   check('unknown flags are rejected', bogus?.result.kind === 'error' && bogus.result.text.includes('Unknown argument'))
 
@@ -251,16 +259,17 @@ try {
   check('removed --force is rejected as unknown', forced?.result.kind === 'error'
     && forced.result.text.includes('Unknown argument'), forced?.result.text ?? '')
 
-  // 三次运行（首次 + 直接替换 + --dry-run）：默认模式每次 3 个 step
-  // （阶段一完整流式 + 阶段二思考过程 + 完成 step），--dry-run 两阶段
-  // 完整流式（2 个 step）；step 号互不冲突（1,2,3 → 4,5,6 → 7,8）。
+  // 运行统计：默认模式每次 3 个 step（阶段一完整流式 + 阶段二思考过程 +
+  // 完成 step），--dry-run 两阶段完整流式（2 个 step），--help 不产生 step；
+  // 共 4 次完整运行（首次 + 直接替换 + --dry-run + --depth 1），step 号
+  // 互不冲突（1,2,3 → 4,5,6 → 7,8 → 9,10,11）。
   const stepStartsAll = owner.session.events.filter(event => event.type === 'step/start')
   check('repeated /init runs use disjoint steps',
-    stepStartsAll.length === 8 && stepStartsAll.map(event => event.data.step).join(',') === '1,2,3,4,5,6,7,8',
+    stepStartsAll.length === 11 && stepStartsAll.map(event => event.data.step).join(',') === '1,2,3,4,5,6,7,8,9,10,11',
     JSON.stringify(stepStartsAll.map(event => event.data)))
-  check('all runs persist to the model-visible surface', owner.session.deriveMessages().length === 14,
+  check('all runs persist to the model-visible surface', owner.session.deriveMessages().length === 19,
     `derived messages: ${owner.session.deriveMessages().length}`)
-  check('all surface nodes rendered', owner.session.surface.nodes.length === 14)
+  check('all surface nodes rendered', owner.session.surface.nodes.length === 19)
 } catch (error) {
   failed = true
   console.error('SMOKE ERROR:', error)

@@ -14,9 +14,10 @@
 - **两阶段 LLM 生成**：先判断、后生成，判断结果作为上下文嵌入生成提示词，避免模型凭空猜测
 - **阶段二显示思考过程、隐藏最终输出**：生成阶段默认只转发模型的 reasoning 流块（思考过程实时可见），`AGENTS.md` 正文直接写入文件、不进入会话；`--dry-run` 时完整流式预览
 - **阶段一默认不思考**：分类任务简单，默认以 `reasoningEffort: 'off'` 关闭思考模式（仅当路由模型支持时才传参），更快更省 token；需要思考时加 `--think`
-- **两层目录结构**：自动收集项目根目录及每个子目录的条目（过滤 `.git`、`node_modules` 等噪音，超限自动折叠），作为模型判断的依据
+- **两层目录结构**：自动收集项目根目录及每个子目录的条目（过滤 `.git`、`node_modules` 等噪音，超限自动折叠），作为模型判断的依据；`--depth` 可调深度（`-1` 不限制），`--ignore` 可额外跳过指定条目
 - **已存在直接替换**：`AGENTS.md` 已存在时直接覆盖，旧内容提供给模型作为改写参考
 - **`--git` 初始化仓库**：仓库不存在时 `git init`、默认分支 `master` → `main`、按项目类型从 [github/gitignore](https://github.com/github/gitignore) 下载 `.gitignore`（已存在不覆盖；无匹配模板时跳过并说明）
+- **`--commit` 初始提交**：生成后创建初始 git 提交（隐式启用 `--git`）
 - **模型路由自动回退**：插件配置 → 会话最近一次请求 → agent 选项
 - **零依赖、无需构建**：仅使用 Node 内置模块，可从源码、`--patch` 覆盖层或 npm/git 安装加载；命令注册是 Cordis effect，插件卸载时自动注销
 
@@ -80,6 +81,10 @@ pnpm dsh web --patch /path/to/dsh-init-command/cordis.patch.yml
 | `/init --dry-run` | 调用模型生成内容但不写文件，两阶段完整流式预览 |
 | `/init --think` | 阶段一（项目分析）改用模型的思考模式；默认不思考（更快更省 token） |
 | `/init --git` | 生成 `AGENTS.md` 后额外执行 git 初始化：仓库不存在时 `git init`、默认分支 `master` → `main`、按项目类型从 [github/gitignore](https://github.com/github/gitignore) 下载 `.gitignore`（已存在时不覆盖） |
+| `/init --commit` | 生成 `AGENTS.md` 后创建初始 git 提交（隐式启用 `--git`）；未配置 git 身份时只提示、不失败 |
+| `/init --depth <n>` | 目录树收集深度：`1` 仅顶层、`2` 两层（默认）、`-1` 不限制 |
+| `/init --ignore <pattern>` | 额外跳过名字匹配的条目（可重复使用或用逗号分隔多个） |
+| `/init --help` | 显示用法与全部参数说明（`-h` 亦可） |
 | `/init --git --dry-run` | 组合使用：只提示将做什么（初始化仓库、下载哪个模板），不执行任何写入 |
 
 示例输出（`--git`）：

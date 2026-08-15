@@ -15,6 +15,7 @@ import {
   apply,
   applyGitSteps,
   collectTree,
+  commitInitial,
   createAssembler,
   downloadGitignore,
   gitignoreTemplate,
@@ -157,7 +158,44 @@ test('apply 注册 /init 命令', () => {
   assert.equal(command.name, 'init')
   assert.ok(command.description.length > 0)
   assert.equal(typeof command.handler, 'function')
-  assert.equal(command.input.hint, '[--dry-run] [--git] [--think]')
+  assert.equal(command.input.hint, '[--dry-run] [--git] [--commit] [--think] [--depth <n>] [--ignore <pattern>]')
+})
+
+test('/init --help 显示用法且不调用模型', async () => {
+  const llm = fakeLlm()
+  const command = captureRegistration(llm)
+
+  const result = await command.handler(invocation(scratch, '--help'))
+
+  assert.equal(result.kind, 'success')
+  assert.match(result.text, /^Usage: \/init/)
+  assert.match(result.text, /--dry-run/)
+  assert.match(result.text, /--commit/)
+  assert.match(result.text, /--depth <n>/)
+  assert.equal(llm.calls.length, 0)
+
+  // -h 同样可用。
+  const short = await command.handler(invocation(scratch, '-h'))
+  assert.equal(short.kind, 'success')
+  assert.match(short.text, /^Usage: \/init/)
+})
+
+test('--depth 缺值或非法值时返回用法错误', async () => {
+  const llm = fakeLlm()
+  const command = captureRegistration(llm)
+
+  const missing = await command.handler(invocation(scratch, '--depth'))
+  assert.equal(missing.kind, 'error')
+  assert.match(missing.text, /--depth requires an integer/)
+
+  const invalid = await command.handler(invocation(scratch, '--depth abc'))
+  assert.equal(invalid.kind, 'error')
+  assert.match(invalid.text, /--depth requires an integer/)
+
+  // --ignore 缺值同样报错。
+  const noPattern = await command.handler(invocation(scratch, '--ignore'))
+  assert.equal(noPattern.kind, 'error')
+  assert.match(noPattern.text, /--ignore requires a pattern/)
 })
 
 test('两阶段调用：先判断项目类型，再嵌入提示词生成 AGENTS.md', async () => {
@@ -429,6 +467,44 @@ test('模型流错误时返回错误结果，且 step 正常关闭', async () =>
   assert.equal(events.filter(event => event.type === 'assistant/message').length, 0)
 })
 
+test('命令开始前已取消：直接返回 Init cancelled. 且不调用模型', async () => {
+  const llm = fakeLlm()
+  const command = captureRegistration(llm)
+  const controller = new AbortController()
+  const inv = invocation(scratch)
+  inv.signal = controller.signal
+  controller.abort()
+
+  const result = await command.handler(inv)
+
+  assert.equal(result.kind, 'error')
+  assert.equal(result.text, 'Init cancelled.')
+  assert.equal(llm.calls.length, 0)
+})
+
+test('流中途取消：统一返回 Init cancelled. 而非模型报错', async () => {
+  const project = path.join(scratch, 'abort-mid')
+  const llm = fakeLlm()
+  const controller = new AbortController()
+  // 第一次调用 stream 时模拟用户取消：置位 signal 后抛 AbortError。
+  llm.stream = () => {
+    controller.abort()
+    return (async function* () {
+      yield { type: 'block-start', index: 0, blockType: 'text' }
+      yield { type: 'text-delta', index: 0, text: 'partial' }
+      throw new Error('This operation was aborted')
+    })()
+  }
+  const command = captureRegistration(llm)
+  const inv = invocation(project)
+  inv.signal = controller.signal
+
+  const result = await command.handler(inv)
+
+  assert.equal(result.kind, 'error')
+  assert.equal(result.text, 'Init cancelled.')
+})
+
 test('模型输出无法解析为 JSON 时宽容降级', async () => {
   const project = path.join(scratch, 'bad-json')
   const llm = fakeLlm({ classifyOutput: '```json\n{"projectType": "Go service"}\n```' })
@@ -508,6 +584,55 @@ test('collectTree 收集两层目录并折叠超限条目', async () => {
   assert.ok(lines.includes('docs/'))
   // .git、node_modules 等噪音被跳过。
   assert.ok(!lines.some(line => line.includes('.git')))
+})
+
+test('collectTree --depth 控制收集深度（1 = 仅顶层，-1 = 不限制）', async () => {
+  const project = path.join(scratch, 'tree-depth')
+  await mkdir(path.join(project, 'src', 'utils'), { recursive: true })
+  await writeFile(path.join(project, 'src', 'main.js'), '')
+  await writeFile(path.join(project, 'src', 'utils', 'fmt.js'), '')
+  await writeFile(path.join(project, 'README.md'), '')
+
+  // depth 1：只列出顶层，不进入子目录。
+  const top = await collectTree(project, { depth: 1 })
+  assert.ok(top.includes('src/'))
+  assert.ok(top.includes('README.md'))
+  assert.ok(!top.some(line => line.startsWith('  ')))
+
+  // depth -1：不限制深度，第三层也出现（缩进逐层 +2）。
+  const deep = await collectTree(project, { depth: -1 })
+  assert.ok(deep.includes('  utils/'))
+  assert.ok(deep.includes('    fmt.js'))
+  assert.ok(deep.includes('  main.js'))
+})
+
+test('collectTree --ignore 跳过名字匹配的条目', async () => {
+  const project = path.join(scratch, 'tree-ignore')
+  await mkdir(path.join(project, 'build', 'cache'), { recursive: true })
+  await mkdir(path.join(project, 'src'), { recursive: true })
+  await writeFile(path.join(project, 'src', 'main.js'), '')
+
+  const lines = await collectTree(project, { ignore: ['build', 'cache'] })
+
+  assert.ok(lines.includes('src/'))
+  assert.ok(lines.includes('  main.js'))
+  assert.ok(!lines.some(line => line.includes('build')))
+  assert.ok(!lines.some(line => line.includes('cache')))
+})
+
+test('/init --depth 1 的目录树只含顶层', async () => {
+  const project = path.join(scratch, 'init-depth')
+  await mkdir(path.join(project, 'src'), { recursive: true })
+  await writeFile(path.join(project, 'src', 'main.js'), '')
+  const llm = fakeLlm()
+  const command = captureRegistration(llm)
+
+  const result = await command.handler(invocation(project, '--depth 1'))
+
+  assert.equal(result.kind, 'success')
+  const classifyText = llm.calls[0].messages[0].content[0].text
+  assert.match(classifyText, /src\//)
+  assert.ok(!classifyText.includes('  main.js'))
 })
 
 test('parseClassifiedJson 剥离 markdown 围栏并容错', () => {
@@ -746,6 +871,63 @@ test('applyGitSteps 项目位于父仓库内时不新建嵌套仓库', async () 
 
   assert.match(lines.join('; '), /inside an existing git repository/)
   await assert.rejects(readFile(path.join(child, '.gitignore'), 'utf8'), { code: 'ENOENT' })
+})
+
+test('commitInitial 暂存 AGENTS.md 与 .gitignore 并创建提交', async () => {
+  const project = path.join(scratch, 'commit-initial')
+  await mkdir(project, { recursive: true })
+  await execFileAsync('git', ['-C', project, 'init'])
+  await execFileAsync('git', ['-C', project, 'config', 'user.name', 't'])
+  await execFileAsync('git', ['-C', project, 'config', 'user.email', 't@t'])
+  await writeFile(path.join(project, 'AGENTS.md'), '# AGENTS.md\n', 'utf8')
+  await writeFile(path.join(project, '.gitignore'), 'node_modules/\n', 'utf8')
+
+  assert.equal(await commitInitial(project), true)
+
+  const log = await execFileAsync('git', ['-C', project, 'log', '--oneline'])
+  assert.match(log.stdout, /Add AGENTS\.md via \/init/)
+  const files = await execFileAsync('git', ['-C', project, 'show', '--stat', '--oneline', 'HEAD'])
+  assert.match(files.stdout, /AGENTS\.md/)
+  assert.match(files.stdout, /\.gitignore/)
+
+  // 无变更可提交（AGENTS.md 与 HEAD 一致）时优雅返回 false，不抛出。
+  const bare = path.join(scratch, 'commit-nothing')
+  await mkdir(bare, { recursive: true })
+  await execFileAsync('git', ['-C', bare, 'init'])
+  await execFileAsync('git', ['-C', bare, 'config', 'user.name', 't'])
+  await execFileAsync('git', ['-C', bare, 'config', 'user.email', 't@t'])
+  await writeFile(path.join(bare, 'AGENTS.md'), 'x\n', 'utf8')
+  await execFileAsync('git', ['-C', bare, 'add', 'AGENTS.md'])
+  await execFileAsync('git', ['-C', bare, 'commit', '-m', 'pre'])
+  assert.equal(await commitInitial(bare), false)
+})
+
+test('/init --commit 生成后创建初始提交（隐式启用 --git）', async () => {
+  const project = path.join(scratch, 'init-commit')
+  const llm = fakeLlm()
+  const command = captureRegistration(llm)
+
+  const result = await command.handler(invocation(project, '--commit'))
+
+  assert.equal(result.kind, 'success')
+  assert.match(result.text, /Git: .*initialized a new git repository/)
+  // 身份未配置时优雅降级（成功或失败提示都接受，关键是结果不崩溃）。
+  assert.match(result.text, /created an initial git commit with AGENTS\.md|could not create the initial commit/)
+  assert.equal(await readFile(path.join(project, 'AGENTS.md'), 'utf8'), GENERATED_MD)
+})
+
+test('/init --commit --dry-run 只提示将做什么', async () => {
+  const project = path.join(scratch, 'init-commit-dry')
+  const llm = fakeLlm()
+  const command = captureRegistration(llm)
+
+  const result = await command.handler(invocation(project, '--commit --dry-run'))
+
+  assert.equal(result.kind, 'success')
+  assert.match(result.text, /dry run/)
+  assert.match(result.text, /--git skipped \(dry run\): would initialize a git repository and download Node\.gitignore/)
+  assert.match(result.text, /--commit skipped \(dry run\): would create an initial git commit with AGENTS\.md/)
+  await assert.rejects(readFile(path.join(project, '.git', 'HEAD'), 'utf8'), { code: 'ENOENT' })
 })
 
 test('/init --git 初始化仓库、master → main 并跳过无匹配的 .gitignore', async () => {

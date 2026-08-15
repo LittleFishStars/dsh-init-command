@@ -20,11 +20,14 @@
  *
  * 运行时零依赖（仅 Node 内置模块），无需构建即可从源码 / --patch / npm 加载。
  *
- * 用法：/init [--dry-run] [--git] [--think]
- *   --dry-run  预览将生成的 AGENTS.md 而不写入
- *   --think    阶段一改用思考模式（默认 reasoningEffort 'off'，更快更省 token）
- *   --git      额外 git 初始化：仓库不存在时 init、master → main、
- *              按项目类型下载 github/gitignore 模板（已存在不覆盖）
+ * 用法：/init [--dry-run] [--git] [--commit] [--think] [--depth <n>] [--ignore <pattern>]
+ *   --dry-run          预览将生成的 AGENTS.md 而不写入
+ *   --git              额外 git 初始化：仓库不存在时 init、master → main、
+ *                      按项目类型下载 github/gitignore 模板（已存在不覆盖）
+ *   --commit           创建初始提交（隐式启用 --git）
+ *   --think            阶段一改用思考模式（默认 reasoningEffort 'off'，更快更省 token）
+ *   --depth <n>        目录树深度：1 = 仅顶层，2 = 两层（默认），-1 = 不限制
+ *   --ignore <pattern> 额外跳过名字匹配的条目（可重复或逗号分隔）
  *
  * 模型路由（按优先级）：插件 config → 会话最近一次请求 → agent.options。
  *
@@ -46,7 +49,7 @@ export function apply(ctx, config) {
   return ctx.commands.register({
     name: 'init',
     description: 'Generate an AGENTS.md guide for this project with the model',
-    input: { hint: '[--dry-run] [--git] [--think]' },
+    input: { hint: '[--dry-run] [--git] [--commit] [--think] [--depth <n>] [--ignore <pattern>]' },
     handler: invocation => executeInit(ctx, config, invocation),
   })
 }
@@ -67,4 +70,4 @@ export {
   resolveRoute,
 } from './lib/model.js'
 export { gitignoreTemplate, downloadGitignore } from './lib/gitignore.js'
-export { renameMasterToMain, ensureGitRepo, applyGitSteps } from './lib/git.js'
+export { renameMasterToMain, ensureGitRepo, applyGitSteps, commitInitial } from './lib/git.js'
