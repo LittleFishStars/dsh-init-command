@@ -1,0 +1,7 @@
+# dsh-init-command bundle 层：挂载 /init 命令插件。
+# 通过 `dsh plugin --profile <name> add ./dsh-init-command` 安装，或直接用
+# `dsh web --patch ./cordis.patch.yml` 加载（从源码加载时，将 name 改为
+# index.js 的绝对路径）。
+- insert:
+    - id: init
+      name: dsh-init-command

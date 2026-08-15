@@ -1,0 +1,31 @@
+{
+  "name": "dsh-init-command",
+  "version": "0.1.0",
+  "description": "DSH plugin: /init slash command that generates an AGENTS.md guide for the current project with a two-stage model call",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml"
+  ],
+  "scripts": {
+    "test": "node --test test/init.test.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "agents.md",
+    "command"
+  ],
+  "license": "MIT"
+}
