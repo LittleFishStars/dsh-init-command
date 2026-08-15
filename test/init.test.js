@@ -149,6 +149,12 @@ function invocation(cwd, rawInput = '', agentOverrides = {}) {
   }
 }
 
+/** 创建一个带占位文件的项目目录（空目录会触发"询问用户"，这些测试需要非空树）。 */
+async function seedProject(project) {
+  await mkdir(project, { recursive: true })
+  await writeFile(path.join(project, 'package.json'), '{}\n')
+}
+
 test('插件元数据', () => {
   assert.equal(name, 'dsh-init-command')
 })
@@ -158,7 +164,7 @@ test('apply 注册 /init 命令', () => {
   assert.equal(command.name, 'init')
   assert.ok(command.description.length > 0)
   assert.equal(typeof command.handler, 'function')
-  assert.equal(command.input.hint, '[--dry-run] [--git] [--commit] [--think] [--depth <n>] [--ignore <pattern>]')
+  assert.equal(command.input.hint, '[--dry-run] [--git] [--commit] [--think] [--depth <n>] [--ignore <pattern>] [--desc <text>]')
 })
 
 test('/init --help 在会话中完整展开显示用法且不调用模型', async () => {
@@ -225,10 +231,80 @@ test('--depth 缺值或非法值时返回用法错误', async () => {
   const noPattern = await command.handler(invocation(scratch, '--ignore'))
   assert.equal(noPattern.kind, 'error')
   assert.match(noPattern.text, /--ignore requires a pattern/)
+
+  // --desc 缺值同样报错。
+  const noDesc = await command.handler(invocation(scratch, '--desc'))
+  assert.equal(noDesc.kind, 'error')
+  assert.match(noDesc.text, /--desc requires a project description/)
+})
+
+test('目录为空时向用户询问项目内容并注明还未制作（不调用模型）', async () => {
+  const project = path.join(scratch, 'empty-ask')
+  await mkdir(project, { recursive: true })
+  const llm = fakeLlm()
+  const command = captureRegistration(llm)
+  const inv = invocation(project)
+
+  const result = await command.handler(inv)
+
+  // 命令结果单行返回询问（多行结果会被 GUI 折叠）。
+  assert.equal(result.kind, 'success')
+  assert.match(result.text, /项目目录为空，此项目还未制作/)
+  // 询问内容以 assistant/message 完整写入会话，注明"此项目还未制作"。
+  const askMessage = inv.agent.session.log.find(event =>
+    event.type === 'assistant/message'
+    && event.data.message.content[0].text.includes('项目目录为空——此项目还未制作'))
+  assert.ok(askMessage, '询问应以 assistant/message 写入会话')
+  assert.match(askMessage.data.message.content[0].text, /--desc/)
+  // 不调用模型、不写文件。
+  assert.equal(llm.calls.length, 0)
+  await assert.rejects(readFile(path.join(project, 'AGENTS.md'), 'utf8'), { code: 'ENOENT' })
+})
+
+test('空目录 + --desc：跳过分类，生成注明"尚未制作"的规划稿', async () => {
+  const project = path.join(scratch, 'empty-desc')
+  await mkdir(project, { recursive: true })
+  const llm = fakeLlm()
+  const command = captureRegistration(llm)
+  const desc = 'Node.js Web 服务，Express + SQLite，提供用户认证 API'
+
+  const result = await command.handler(invocation(project, `--desc ${desc}`))
+
+  assert.equal(result.kind, 'success')
+  assert.match(result.text, /Initialized .*AGENTS\.md/)
+  // 只调用一次模型（生成阶段），分类阶段被跳过。
+  assert.equal(llm.calls.length, 1)
+  const [generateCall] = llm.calls
+  const prompt = generateCall.messages[0].content[0].text
+  // 用户描述作为 Summary 嵌入提示词。
+  assert.match(prompt, /- Summary: Node\.js Web 服务/)
+  // 提示词明确要求注明项目尚未实现。
+  assert.match(prompt, /has not been implemented yet/)
+  assert.match(prompt, /此项目还未制作/)
+  // 项目类型标注为未制作项目。
+  assert.match(prompt, /- Project type: 未制作项目/)
+  // AGENTS.md 正常写入。
+  assert.equal(await readFile(path.join(project, 'AGENTS.md'), 'utf8'), GENERATED_MD)
+})
+
+test('非空目录 + --desc：描述覆盖分类出的简介', async () => {
+  const project = path.join(scratch, 'desc-override')
+  await mkdir(project, { recursive: true })
+  await writeFile(path.join(project, 'package.json'), '{}')
+  const llm = fakeLlm()
+  const command = captureRegistration(llm)
+
+  const result = await command.handler(invocation(project, '--desc 一个内部工具'))
+
+  assert.equal(result.kind, 'success')
+  // 分类仍执行（两次调用），但 Summary 来自 --desc。
+  assert.equal(llm.calls.length, 2)
+  assert.match(llm.calls[1].messages[0].content[0].text, /- Summary: 一个内部工具/)
 })
 
 test('两阶段调用：先判断项目类型，再嵌入提示词生成 AGENTS.md', async () => {
   const project = path.join(scratch, 'two-stage')
+  await seedProject(project)
   const llm = fakeLlm()
   const command = captureRegistration(llm)
   const inv = invocation(project)
@@ -421,6 +497,7 @@ test('未知参数（含已取消的 --force）报用法错误', async () => {
 
 test('--think 阶段一使用思考模式（不传 reasoningEffort，保持提供方默认）', async () => {
   const project = path.join(scratch, 'think')
+  await seedProject(project)
   const llm = fakeLlm()
   const command = captureRegistration(llm)
 
@@ -434,6 +511,7 @@ test('--think 阶段一使用思考模式（不传 reasoningEffort，保持提�
 
 test('路由模型不支持 reasoning effort 时阶段一自动降级（不传参）', async () => {
   const project = path.join(scratch, 'no-reasoning')
+  await seedProject(project)
   const llm = fakeLlm()
   llm.resolveCallConfig = async () => {
     throw new Error('provider "p" model "m" does not support reasoning effort "off"')
@@ -449,6 +527,7 @@ test('路由模型不支持 reasoning effort 时阶段一自动降级（不传�
 
 test('路由模型支持 reasoning effort 时阶段一默认关闭思考', async () => {
   const project = path.join(scratch, 'reasoning-off')
+  await seedProject(project)
   const llm = fakeLlm()
   llm.resolveCallConfig = async () => ({ provider: 'deepseek', model: 'deepseek-chat' })
   const command = captureRegistration(llm)
@@ -474,6 +553,7 @@ test('无可用模型路由时报错', async () => {
 
 test('模型流错误时返回错误结果，且 step 正常关闭', async () => {
   const project = path.join(scratch, 'llm-error')
+  await seedProject(project)
   const llm = fakeLlm({ classifyOutput: '' })
   // 让判断阶段返回错误终止：替换 stream 返回 finish error。
   llm.stream = options => (async function* () {
@@ -513,6 +593,7 @@ test('命令开始前已取消：直接返回 Init cancelled. 且不调用模型
 
 test('流中途取消：统一返回 Init cancelled. 而非模型报错', async () => {
   const project = path.join(scratch, 'abort-mid')
+  await seedProject(project)
   const llm = fakeLlm()
   const controller = new AbortController()
   // 第一次调用 stream 时模拟用户取消：置位 signal 后抛 AbortError。
@@ -536,6 +617,7 @@ test('流中途取消：统一返回 Init cancelled. 而非模型报错', async 
 
 test('模型输出无法解析为 JSON 时宽容降级', async () => {
   const project = path.join(scratch, 'bad-json')
+  await seedProject(project)
   const llm = fakeLlm({ classifyOutput: '```json\n{"projectType": "Go service"}\n```' })
   const command = captureRegistration(llm)
 
@@ -548,6 +630,7 @@ test('模型输出无法解析为 JSON 时宽容降级', async () => {
 
 test('分类阶段 max-tokens 截断但 JSON 完整时继续生成', async () => {
   const project = path.join(scratch, 'truncated-classify')
+  await seedProject(project)
   const llm = fakeLlm({ classifyFinish: { kind: 'max-tokens' } })
   const command = captureRegistration(llm)
 
@@ -563,6 +646,7 @@ test('分类阶段 max-tokens 截断但 JSON 完整时继续生成', async () =>
 
 test('分类阶段截断且无法解析时降级为 unknown 继续', async () => {
   const project = path.join(scratch, 'truncated-garbage')
+  await seedProject(project)
   const llm = fakeLlm({
     classifyOutput: 'truncated garbage without json',
     classifyFinish: { kind: 'max-tokens' },
@@ -578,6 +662,7 @@ test('分类阶段截断且无法解析时降级为 unknown 继续', async () =>
 
 test('生成阶段 max-tokens 截断时报错且不写文件', async () => {
   const project = path.join(scratch, 'truncated-generate')
+  await seedProject(project)
   const llm = fakeLlm({ generateFinish: { kind: 'max-tokens' } })
   const command = captureRegistration(llm)
 
@@ -933,6 +1018,7 @@ test('commitInitial 暂存 AGENTS.md 与 .gitignore 并创建提交', async () =
 
 test('/init --commit 生成后创建初始提交（隐式启用 --git）', async () => {
   const project = path.join(scratch, 'init-commit')
+  await seedProject(project)
   const llm = fakeLlm()
   const command = captureRegistration(llm)
 
@@ -947,6 +1033,7 @@ test('/init --commit 生成后创建初始提交（隐式启用 --git）', async
 
 test('/init --commit --dry-run 只提示将做什么', async () => {
   const project = path.join(scratch, 'init-commit-dry')
+  await seedProject(project)
   const llm = fakeLlm()
   const command = captureRegistration(llm)
 
@@ -961,6 +1048,7 @@ test('/init --commit --dry-run 只提示将做什么', async () => {
 
 test('/init --git 初始化仓库、master → main 并跳过无匹配的 .gitignore', async () => {
   const project = path.join(scratch, 'init-git')
+  await seedProject(project)
   const llm = fakeLlm({
     classifyOutput: '{"projectType": "Legacy mainframe system", "languages": ["COBOL"], "toolchain": ["z/OS"]}',
   })
@@ -978,6 +1066,7 @@ test('/init --git 初始化仓库、master → main 并跳过无匹配的 .gitig
 
 test('/init --git --dry-run 只提示将做什么而不执行任何写入', async () => {
   const project = path.join(scratch, 'init-git-dry')
+  await seedProject(project)
   const llm = fakeLlm()
   const command = captureRegistration(llm)
 

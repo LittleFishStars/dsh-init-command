@@ -20,7 +20,7 @@
  *
  * 运行时零依赖（仅 Node 内置模块），无需构建即可从源码 / --patch / npm 加载。
  *
- * 用法：/init [--dry-run] [--git] [--commit] [--think] [--depth <n>] [--ignore <pattern>]
+ * 用法：/init [--dry-run] [--git] [--commit] [--think] [--depth <n>] [--ignore <pattern>] [--desc <text>]
  *   --dry-run          预览将生成的 AGENTS.md 而不写入
  *   --git              额外 git 初始化：仓库不存在时 init、master → main、
  *                      按项目类型下载 github/gitignore 模板（已存在不覆盖）
@@ -28,6 +28,7 @@
  *   --think            阶段一改用思考模式（默认 reasoningEffort 'off'，更快更省 token）
  *   --depth <n>        目录树深度：1 = 仅顶层，2 = 两层（默认），-1 = 不限制
  *   --ignore <pattern> 额外跳过名字匹配的条目（可重复或逗号分隔）
+ *   --desc <text>      目录为空时描述项目（放在最后；生成注明"尚未制作"的规划稿）
  *
  * 模型路由（按优先级）：插件 config → 会话最近一次请求 → agent.options。
  *
@@ -49,7 +50,7 @@ export function apply(ctx, config) {
   return ctx.commands.register({
     name: 'init',
     description: 'Generate an AGENTS.md guide for this project with the model',
-    input: { hint: '[--dry-run] [--git] [--commit] [--think] [--depth <n>] [--ignore <pattern>]' },
+    input: { hint: '[--dry-run] [--git] [--commit] [--think] [--depth <n>] [--ignore <pattern>] [--desc <text>]' },
     handler: invocation => executeInit(ctx, config, invocation),
   })
 }

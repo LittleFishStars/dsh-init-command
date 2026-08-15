@@ -252,6 +252,18 @@ try {
     help?.result.kind === 'success' && helpMessage !== undefined,
     help?.result.text ?? '')
 
+  // 空目录：询问用户项目内容并注明"此项目还未制作"（独立 agent，不污染上面的计数）。
+  const emptyProject = join(root, 'empty-project')
+  await mkdir(emptyProject)
+  const emptyOwner = agent(context, emptyProject)
+  const emptyAsk = await context.commands.execute(emptyOwner, '/init', signal)
+  const askMessage = emptyOwner.session.events.find(event => event.type === 'assistant/message'
+    && typeof event.data.message.content[0]?.text === 'string'
+    && event.data.message.content[0].text.includes('项目目录为空——此项目还未制作'))
+  check('empty directory asks for the project content (not made yet)',
+    emptyAsk?.result.kind === 'success' && askMessage !== undefined,
+    emptyAsk?.result.text ?? '')
+
   const depth = await context.commands.execute(owner, '/init --depth 1', signal)
   check('--depth 1 still succeeds', depth?.result.kind === 'success'
     && depth.result.text.includes('Initialized'), depth?.result.text ?? '')
