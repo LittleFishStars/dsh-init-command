@@ -43,12 +43,13 @@ after(async () => {
 
 const CLASSIFIED_JSON = '{"projectType": "Node.js web application", "languages": ["JavaScript"], "toolchain": ["npm"], "summary": "A demo app."}'
 const GENERATED_MD = '# AGENTS.md\n\n## Project overview\n\nA demo app.\n'
+const GENERATED_REASONING = 'Drafting the AGENTS.md from the analyzed structure...'
 
 /**
  * 构造一个记录每次调用参数的 fake `ctx.llm`：根据消息内容区分两阶段，
- * 判断阶段返回 JSON，生成阶段返回 AGENTS.md 文本。可通过选项覆盖
- * 输出与终止原因（模拟截断/失败场景）。流的块形状与真实适配器一致：
- * block-start → text-delta → block-end → usage → finish。
+ * 判断阶段返回 JSON，生成阶段返回 reasoning 块 + AGENTS.md 文本。可通过
+ * 选项覆盖输出与终止原因（模拟截断/失败场景）。流的块形状与真实适配器
+ * 一致：block-start → reasoning/text-delta → block-end → usage → finish。
  */
 function fakeLlm({
   classifyOutput = CLASSIFIED_JSON,
@@ -58,12 +59,24 @@ function fakeLlm({
   includeUsage = true,
 } = {}) {
   const calls = []
-  const streamFor = text => [
-    { type: 'block-start', index: 0, blockType: 'text' },
-    { type: 'text-delta', index: 0, text },
-    { type: 'block-end', index: 0, block: { type: 'text', text } },
-    ...includeUsage ? [{ type: 'usage', usage: { inputTokens: 10, outputTokens: 20 } }] : [],
-  ]
+  // 判断阶段：纯 text 流；生成阶段：先 reasoning 块再 text 块（验证
+  // reasoningOnly 模式只转发思考过程、隐藏最终输出）。
+  const streamFor = (text, withReasoning) => withReasoning
+    ? [
+      { type: 'block-start', index: 0, blockType: 'reasoning' },
+      { type: 'reasoning-delta', index: 0, text: GENERATED_REASONING },
+      { type: 'block-end', index: 0, block: { type: 'reasoning', text: GENERATED_REASONING } },
+      { type: 'block-start', index: 1, blockType: 'text' },
+      { type: 'text-delta', index: 1, text },
+      { type: 'block-end', index: 1, block: { type: 'text', text } },
+      ...includeUsage ? [{ type: 'usage', usage: { inputTokens: 10, outputTokens: 20 } }] : [],
+    ]
+    : [
+      { type: 'block-start', index: 0, blockType: 'text' },
+      { type: 'text-delta', index: 0, text },
+      { type: 'block-end', index: 0, block: { type: 'text', text } },
+      ...includeUsage ? [{ type: 'usage', usage: { inputTokens: 10, outputTokens: 20 } }] : [],
+    ]
   return {
     calls,
     stream(options) {
@@ -71,10 +84,10 @@ function fakeLlm({
       return (async function* () {
         const text = options.messages[0].content[0].text
         if (text.includes('Respond with ONLY a JSON')) {
-          yield* streamFor(classifyOutput)
+          yield* streamFor(classifyOutput, false)
           yield { type: 'finish', reason: classifyFinish }
         } else {
-          yield* streamFor(generateOutput)
+          yield* streamFor(generateOutput, true)
           yield { type: 'finish', reason: generateFinish }
         }
       })()
@@ -187,22 +200,22 @@ test('两阶段调用：先判断项目类型，再嵌入提示词生成 AGENTS.
   // 写入的是第二阶段生成的完整内容。
   assert.equal(await readFile(path.join(project, 'AGENTS.md'), 'utf8'), GENERATED_MD)
 
-  // —— 实时流式写入（阶段一）：提示词与用户输入同等地位，模型输出逐块实时转发 ——
+  // —— 实时流式写入：阶段一完整显示，阶段二只显示思考过程（reasoning 流块
+  // 实时转发、最终输出不进入会话），成功后追加完成信息 ——
   const events = inv.agent.session.log
   const types = events.map(event => event.type)
-  // 阶段二（生成）默认静默流式执行：模型输出不进入会话日志（生成内容
-  // 直接写文件），但追加一条简短的完成信息——共两对 step 开合（step 1：
-  // 阶段一完整流式；step 2：阶段二完成信息）；合成显示不写 turn/start、
-  // turn/end（turn 0 的 turn/end 会被持久化读取路径按旧格式损坏拒绝，
-  // 正数 turn 又会与 agent 循环编号冲突）。
+  // 三个阶段 step：阶段一完整流式（step 1）、阶段二思考过程（step 2）、
+  // 完成信息（step 3）；合成显示不写 turn/start、turn/end（turn 0 的
+  // turn/end 会被持久化读取路径按旧格式损坏拒绝，正数 turn 又会与 agent
+  // 循环编号冲突）。
   assert.equal(types.filter(type => type === 'turn/start').length, 0)
   assert.equal(types.filter(type => type === 'turn/end').length, 0)
-  assert.deepEqual(events.filter(event => event.type === 'step/start').map(event => event.data.step), [1, 2])
-  assert.deepEqual(events.filter(event => event.type === 'step/end').map(event => event.data.step), [1, 2])
-  // 阶段一有一条 user 消息（提示词），阶段二有一条完成信息，都是插件
-  // 注入的 notice 上下文（GUI 折叠显示一行摘要，点击展开全文）。
+  assert.deepEqual(events.filter(event => event.type === 'step/start').map(event => event.data.step), [1, 2, 3])
+  assert.deepEqual(events.filter(event => event.type === 'step/end').map(event => event.data.step), [1, 2, 3])
+  // 三条 user 消息（都是插件注入的 notice 上下文，GUI 折叠显示一行摘要）：
+  // 阶段一提示词、阶段二提示词、阶段二完成信息。
   const userMessages = events.filter(event => event.type === 'user/message')
-  assert.equal(userMessages.length, 2)
+  assert.equal(userMessages.length, 3)
   assert.equal(userMessages[0].surfaceOp, 'append')
   assert.equal(userMessages[0].data.content[0].text, classifyCall.messages[0].content[0].text)
   assert.deepEqual(userMessages[0].data.source, {
@@ -211,18 +224,30 @@ test('两阶段调用：先判断项目类型，再嵌入提示词生成 AGENTS.
     form: 'notice',
     summary: `阶段 1：项目分析（${promptLineCount(classifyCall.messages[0].content[0].text)} 行）`,
   })
-  // assistant/chunk 逐块实时转发：block-start、text-delta、block-end、usage、
-  // finish 全部实时转发（与 agent 循环一致，阶段一共 5 个 chunk 事件）。
+  // 阶段二提示词 notice：内容与发送给模型的生成提示词一致。
+  assert.equal(userMessages[1].data.content[0].text, generateCall.messages[0].content[0].text)
+  assert.deepEqual(userMessages[1].data.source, {
+    kind: 'plugin',
+    plugin: 'dsh-init-command',
+    form: 'notice',
+    summary: `阶段 2：AGENTS.md 生成（${promptLineCount(generateCall.messages[0].content[0].text)} 行）`,
+  })
+  // assistant/chunk：阶段一 5 个全部转发（block-start、text-delta、block-end、
+  // usage、finish）；阶段二 reasoningOnly 只转发 reasoning 块与 usage/finish
+  // （共 5 个），text 块不进入会话。
   const chunks = events.filter(event => event.type === 'assistant/chunk')
-  assert.equal(chunks.length, 5)
-  assert.deepEqual(chunks.map(event => event.data.turn), Array(5).fill(INIT_TURN))
-  assert.deepEqual(chunks.map(event => event.data.step), [1, 1, 1, 1, 1])
-  assert.equal(chunks[0].data.chunk.type, 'block-start')
-  assert.equal(chunks[1].data.chunk.type, 'text-delta')
-  assert.equal(chunks[4].data.chunk.type, 'finish')
-  // 阶段二不流式输出：没有生成阶段的提示词或流块（生成内容直接写文件，
-  // 上面已验证 AGENTS.md 内容为 GENERATED_MD）；阶段一的模型输出是唯一
-  // 来自模型调用的 assistant 消息，阶段二另有一条合成的成功状态消息。
+  assert.equal(chunks.length, 10)
+  assert.deepEqual(chunks.map(event => event.data.turn), Array(10).fill(INIT_TURN))
+  assert.deepEqual(chunks.map(event => event.data.step), [1, 1, 1, 1, 1, 2, 2, 2, 2, 2])
+  const stepOneChunks = chunks.filter(event => event.data.step === 1)
+  assert.deepEqual(stepOneChunks.map(event => event.data.chunk.type), ['block-start', 'text-delta', 'block-end', 'usage', 'finish'])
+  // 阶段二（step 2）只转发思考过程：reasoning 块实时可见，text 块被隐藏。
+  const stepTwoChunks = chunks.filter(event => event.data.step === 2)
+  assert.deepEqual(stepTwoChunks.map(event => event.data.chunk.type), ['block-start', 'reasoning-delta', 'block-end', 'usage', 'finish'])
+  assert.deepEqual(stepTwoChunks.map(event => event.data.chunk.blockType ?? event.data.chunk.block?.type), ['reasoning', undefined, 'reasoning', undefined, undefined])
+  assert.ok(!stepTwoChunks.some(event => event.data.chunk.type === 'text-delta'))
+  // assistant/message 只有两条：阶段一模型输出（step 1）与合成的成功状态
+  // 消息（step 3）——生成的 AGENTS.md 内容不进入会话。
   const assistantMessages = events.filter(event => event.type === 'assistant/message')
   assert.equal(assistantMessages.length, 2)
   // assistant/message 携带组装好的内容、模型来源与 usage。
@@ -232,14 +257,13 @@ test('两阶段调用：先判断项目类型，再嵌入提示词生成 AGENTS.
   assert.deepEqual(assistantMessages[0].data.message.source, { kind: 'model', provider: 'deepseek', model: 'deepseek-chat' })
   assert.equal(assistantMessages[0].data.usage.inputTokens, 10)
   // sourceEventSeqs 完整覆盖来源 chunk。
-  const firstStepChunks = chunks.filter(event => event.data.step === 1)
   assert.deepEqual(
     assistantMessages[0].sourceEventSeqs,
-    firstStepChunks.map(event => event.seq),
+    stepOneChunks.map(event => event.seq),
   )
 
   // 阶段二完成信息 notice：只报告路径、字符数与预览方式，不包含 AGENTS.md 内容。
-  const completion = userMessages[1]
+  const completion = userMessages[2]
   assert.equal(completion.surfaceOp, 'append')
   assert.match(completion.data.content[0].text, /^AGENTS\.md 已生成：.+（\d+ 字符）。/)
   assert.match(completion.data.content[0].text, /--dry-run/)
@@ -256,7 +280,7 @@ test('两阶段调用：先判断项目类型，再嵌入提示词生成 AGENTS.
   const success = assistantMessages[1]
   assert.equal(success.surfaceOp, 'append')
   assert.equal(success.data.turn, INIT_TURN)
-  assert.equal(success.data.step, 2)
+  assert.equal(success.data.step, 3)
   assert.equal(success.data.message.role, 'assistant')
   assert.deepEqual(success.data.message.source, { kind: 'model', provider: 'deepseek', model: 'deepseek-chat' })
   assert.equal(success.data.usage, undefined)
@@ -264,9 +288,9 @@ test('两阶段调用：先判断项目类型，再嵌入提示词生成 AGENTS.
   assert.match(success.data.message.content[0].text, /Node\.js web application/)
   assert.match(success.data.message.content[0].text, /--dry-run/)
   assert.ok(!success.data.message.content[0].text.includes('# AGENTS.md'))
-  // 完成 step 是最后一个事件：step 2 正常关闭。
+  // 完成 step 是最后一个事件：step 3 正常关闭。
   assert.equal(events.at(-1).type, 'step/end')
-  assert.deepEqual(events.at(-1).data, { turn: INIT_TURN, step: 2 })
+  assert.deepEqual(events.at(-1).data, { turn: INIT_TURN, step: 3 })
 })
 
 test('已存在的 AGENTS.md 直接替换，旧内容作为改写参考传给模型', async () => {
@@ -304,13 +328,19 @@ test('--dry-run 预览内容而不写入', async () => {
   assert.match(result.text, /Model calls:/)
   assert.match(result.text, /2\. generate — .*dry run, not written/)
   assert.equal(await readFile(target, 'utf8'), 'old\n')
-  // --dry-run 时阶段二与阶段一一样完整流式显示（两对 turn/step、两条
-  // notice、10 个 chunk、两条 assistant 消息），便于预览。
+  // --dry-run 时阶段二与阶段一一样完整流式显示（两条 notice、13 个 chunk、
+  // 两条 assistant 消息），便于预览。
   const events = inv.agent.session.log
   assert.equal(events.filter(event => event.type === 'user/message').length, 2)
   assert.equal(events.filter(event => event.type === 'step/start').length, 2)
-  assert.equal(events.filter(event => event.type === 'assistant/chunk').length, 10)
+  // 阶段一 5 个 chunk + 阶段二 8 个 chunk（reasoning 块 + text 块 + usage + finish）。
+  assert.equal(events.filter(event => event.type === 'assistant/chunk').length, 13)
   assert.equal(events.filter(event => event.type === 'assistant/message').length, 2)
+  // 阶段二完整流式时 text 块也可见（与默认模式的 reasoningOnly 相反）。
+  const stepTwoChunks = events
+    .filter(event => event.type === 'assistant/chunk')
+    .filter(event => event.data.step === 2)
+  assert.ok(stepTwoChunks.some(event => event.data.chunk.type === 'text-delta'))
 })
 
 test('未知参数（含已取消的 --force）报用法错误', async () => {
@@ -572,9 +602,9 @@ test('streamModelStage 直接调用时实时写入提示词、流块与 step 开
     temperature: 0,
   })
 
-  // 提示词不含分类标记，走生成分支。
+  // 提示词不含分类标记，走生成分支（reasoning 块 + text 块）。
   assert.equal(output.text, GENERATED_MD)
-  assert.equal(output.blocks[0].type, 'text')
+  assert.deepEqual(output.blocks.map(block => block.type), ['reasoning', 'text'])
   assert.equal(llm.calls[0].temperature, 0)
   const types = session.log.map(event => event.type)
   assert.deepEqual(

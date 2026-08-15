@@ -2,7 +2,7 @@
 
 ## Project overview
 
-This repository is a JavaScript/Node.js npm package that provides the `init` command for the dsh ecosystem as a Cordis-based Node.js command module. The project is a command-line initialization tool for the dsh project, providing setup commands and smoke testing. The toolchain includes Node.js, npm, Cordis, and `node:test`. The project includes unit tests and smoke-loading scripts.
+This repository is a JavaScript/Node.js npm package that provides the `init` command for the dsh ecosystem as a Cordis-based Node.js command module. The project is a command-line initialization tool for the dsh project, providing setup commands and smoke testing. The toolchain includes Node.js, npm, git, Cordis, and `node:test`. The project includes unit tests and smoke-loading scripts.
 
 Key files include:
 

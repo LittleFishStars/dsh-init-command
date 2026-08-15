@@ -46,9 +46,11 @@ class FakeLlm extends Service {
     return (async function* () {
       const text = options.messages[0].content[0].text
       if (text.includes('Respond with ONLY a JSON')) {
-        yield { type: 'text-delta', text: CLASSIFIED_JSON }
+        yield { type: 'text-delta', index: 0, text: CLASSIFIED_JSON }
       } else {
-        yield { type: 'text-delta', text: GENERATED_MD }
+        // 生成阶段：先 reasoning 块再 text 块，验证阶段二默认只转发思考过程。
+        yield { type: 'reasoning-delta', index: 0, text: 'Drafting the AGENTS.md structure...' }
+        yield { type: 'text-delta', index: 1, text: GENERATED_MD }
       }
       yield { type: 'finish', reason: { kind: 'stop' } }
     })()
@@ -159,10 +161,19 @@ try {
       && typeof event.data.source.summary === 'string'
       && /^阶段 1：.+（\d+ 行）$/.test(event.data.source.summary)),
     JSON.stringify(stageOneNotices.map(event => event.data.source)))
-  // 阶段二默认不流式输出，只追加一条简短的完成信息 notice（路径、字符数、
-  // 预览方式），完整 AGENTS.md 内容不进入会话。
-  const completionNotices = userMessages.filter(event => /^阶段 2：/.test(event.data.source.summary))
-  check('stage 2 emits a brief completion notice, not the content',
+  // 阶段二默认只显示思考过程：追加阶段二提示词 notice（折叠行摘要），
+  // reasoning 流块实时转发（text 块隐藏），最后追加一条简短的完成信息
+  // notice（路径、字符数、预览方式）；完整 AGENTS.md 内容不进入会话。
+  const stageTwoNotices = userMessages.filter(event => /^阶段 2：AGENTS\.md 生成/.test(event.data.source.summary))
+  check('stage 2 prompt surfaces as a collapsible notice row',
+    stageTwoNotices.length === 1
+    && stageTwoNotices[0].surfaceOp === 'append'
+    && stageTwoNotices[0].data.source.form === 'notice'
+    && /^阶段 2：AGENTS\.md 生成（\d+ 行）$/.test(stageTwoNotices[0].data.source.summary)
+    && stageTwoNotices[0].data.content[0].text.includes('Task: create an AGENTS.md'),
+    JSON.stringify(stageTwoNotices.map(event => event.data.source)))
+  const completionNotices = userMessages.filter(event => /^阶段 2：AGENTS\.md 已生成/.test(event.data.source.summary))
+  check('stage 2 closes with a brief completion notice, not the content',
     completionNotices.length === 1
     && completionNotices[0].surfaceOp === 'append'
     && completionNotices[0].data.source.form === 'notice'
@@ -171,9 +182,16 @@ try {
     && /--dry-run/.test(completionNotices[0].data.content[0].text)
     && !completionNotices[0].data.content[0].text.includes('# AGENTS.md'),
     JSON.stringify(completionNotices.map(event => event.data)))
-  // 完成 step 还以 assistant/message 追加一条形如模型正式输出的成功状态
-  // 消息（来源复用模型路由，满足持久化加载对 assistant/message 的来源校验）。
-  const successMessages = events.filter(event => event.type === 'assistant/message' && event.data.step === 2)
+  // 阶段二 step（step 2）只转发思考过程：reasoning 流块可见、text 块不进入
+  // 会话；成功状态消息在完成 step（step 3）以 assistant/message 呈现（来源
+  // 复用模型路由，满足持久化加载对 assistant/message 的来源校验）。
+  const stepTwoChunks = events.filter(event => event.type === 'assistant/chunk' && event.data.step === 2)
+  check('stage 2 streams only the reasoning, hiding the output',
+    stepTwoChunks.length >= 2
+    && stepTwoChunks.some(event => event.data.chunk.type === 'reasoning-delta')
+    && !stepTwoChunks.some(event => event.data.chunk.type === 'text-delta'),
+    JSON.stringify(stepTwoChunks.map(event => event.data.chunk)))
+  const successMessages = events.filter(event => event.type === 'assistant/message' && event.data.step === 3)
   check('stage 2 closes with a formal success status message',
     successMessages.length === 1
     && successMessages[0].surfaceOp === 'append'
@@ -200,18 +218,18 @@ try {
       turnEnds: turnEnds.map(event => event.data),
     }))
   const stepStarts = events.filter(event => event.type === 'step/start')
-  check('steps advance per visible model call', stepStarts.length === 2
-    && stepStarts[0].data.step === 1 && stepStarts[1].data.step === 2
+  check('steps advance per visible model call', stepStarts.length === 3
+    && stepStarts[0].data.step === 1 && stepStarts[1].data.step === 2 && stepStarts[2].data.step === 3
     && stepStarts.every(event => event.data.turn === INIT_TURN),
     JSON.stringify(stepStarts.map(event => event.data)))
 
-  // 阶段一的提示词与模型输出、阶段二的完成信息 notice 与成功状态消息
-  // 进入模型可见的会话表面；生成内容本身不进入会话（silent 流式调用，
-  // 直接写入文件）。
+  // 阶段一的提示词与模型输出、阶段二的提示词 notice、完成信息 notice 与
+  // 成功状态消息进入模型可见的会话表面；生成内容本身不进入会话（只转发
+  // 思考过程，内容直接写入文件）。
   const messages = owner.session.deriveMessages()
-  check('prompts, outputs and stage-2 notices enter model-visible surface', messages.length === 4,
+  check('prompts, stage-2 notices and outputs enter model-visible surface', messages.length === 5,
     `derived messages: ${messages.length}`)
-  check('surface nodes rendered', owner.session.surface.nodes.length === 4)
+  check('surface nodes rendered', owner.session.surface.nodes.length === 5)
 
   // 调用记录随 command/done 事件持久化到会话日志（白名单事件，恢复安全）。
   const done = owner.session.events.find(event => event.type === 'command/done')
@@ -234,16 +252,16 @@ try {
   check('removed --force is rejected as unknown', forced?.result.kind === 'error'
     && forced.result.text.includes('Unknown argument'), forced?.result.text ?? '')
 
-  // 三次运行（首次 + 直接替换 + --dry-run）：默认模式每次 2 个 step
-  // （阶段一完整流式 + 阶段二完成 step），--dry-run 两阶段完整流式
-  // （2 个 step）；step 号互不冲突（1,2 → 3,4 → 5,6）。
+  // 三次运行（首次 + 直接替换 + --dry-run）：默认模式每次 3 个 step
+  // （阶段一完整流式 + 阶段二思考过程 + 完成 step），--dry-run 两阶段
+  // 完整流式（2 个 step）；step 号互不冲突（1,2,3 → 4,5,6 → 7,8）。
   const stepStartsAll = owner.session.events.filter(event => event.type === 'step/start')
   check('repeated /init runs use disjoint steps',
-    stepStartsAll.length === 6 && stepStartsAll.map(event => event.data.step).join(',') === '1,2,3,4,5,6',
+    stepStartsAll.length === 8 && stepStartsAll.map(event => event.data.step).join(',') === '1,2,3,4,5,6,7,8',
     JSON.stringify(stepStartsAll.map(event => event.data)))
-  check('all runs persist to the model-visible surface', owner.session.deriveMessages().length === 12,
+  check('all runs persist to the model-visible surface', owner.session.deriveMessages().length === 14,
     `derived messages: ${owner.session.deriveMessages().length}`)
-  check('all surface nodes rendered', owner.session.surface.nodes.length === 12)
+  check('all surface nodes rendered', owner.session.surface.nodes.length === 14)
 } catch (error) {
   failed = true
   console.error('SMOKE ERROR:', error)
